@@ -13,13 +13,12 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-
 use crate::models::migration::{MigrationItemType, MigrationJobStatus};
 use crate::services::artifact_service::ArtifactService;
 use crate::services::artifactory_client::ArtifactoryClient;
 use crate::services::migration_service::{ConflictType, MigrationError, MigrationService};
 use crate::services::source_registry::SourceRegistry;
-use crate::storage::StorageBackend;
+use crate::storage::{StorageBackend, StorageLocation, StorageRegistry};
 
 /// Configuration for the migration worker
 #[derive(Debug, Clone)]
@@ -158,7 +157,7 @@ pub struct ProgressUpdate {
 pub struct MigrationWorker {
     db: PgPool,
     migration_service: MigrationService,
-    storage: Arc<dyn StorageBackend>,
+    storage_registry: Arc<StorageRegistry>,
     config: WorkerConfig,
     cancel_token: CancellationToken,
 }
@@ -167,7 +166,7 @@ impl MigrationWorker {
     /// Create a new migration worker
     pub fn new(
         db: PgPool,
-        storage: Arc<dyn StorageBackend>,
+        storage_registry: Arc<StorageRegistry>,
         config: WorkerConfig,
         cancel_token: CancellationToken,
     ) -> Self {
@@ -175,10 +174,30 @@ impl MigrationWorker {
         Self {
             db,
             migration_service,
-            storage,
+            storage_registry,
             config,
             cancel_token,
         }
+    }
+
+    async fn storage_for_repo(&self, repo_key: &str) -> Result<Arc<dyn StorageBackend>, MigrationError> {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT storage_backend, storage_path FROM repositories WHERE key = $1",
+        )
+        .bind(repo_key)
+        .fetch_optional(&self.db)
+        .await?;
+
+        let (backend, path) = row.ok_or_else(|| {
+            MigrationError::StorageError(format!(
+                "Repository '{}' not found while resolving storage backend",
+                repo_key
+            ))
+        })?;
+
+        self.storage_registry
+            .backend_for(&StorageLocation { backend, path })
+            .map_err(|e| MigrationError::StorageError(e.to_string()))
     }
 
     /// Get a reference to the database pool
@@ -208,6 +227,17 @@ impl MigrationWorker {
         let include_artifacts = true;
         let include_metadata = true;
         let repos = config.include_repos.clone();
+        let date_from = config.date_from.map(|dt| dt.to_rfc3339());
+        let date_to = config.date_to.map(|dt| dt.to_rfc3339());
+
+        if date_from.is_some() || date_to.is_some() {
+            tracing::info!(
+                job_id = %job_id,
+                date_from = ?date_from,
+                date_to = ?date_to,
+                "Migration job will process only artifacts in the requested date window"
+            );
+        }
 
         // Update job status to running
         self.migration_service
@@ -359,12 +389,23 @@ impl MigrationWorker {
             }
 
             if include_artifacts {
+                let repo_storage = match self.storage_for_repo(repo_key).await {
+                    Ok(storage) => storage,
+                    Err(e) => {
+                        tracing::error!(repo = %repo_key, error = %e, "Failed to resolve repository storage");
+                        continue;
+                    }
+                };
+
                 match self
                     .process_repository_artifacts(
                         job_id,
                         client.clone(),
+                        repo_storage,
                         repo_key,
                         package_type,
+                        date_from.as_deref(),
+                        date_to.as_deref(),
                         conflict_resolution,
                         include_metadata,
                         &mut total_completed,
@@ -431,8 +472,11 @@ impl MigrationWorker {
         &self,
         job_id: Uuid,
         client: Arc<dyn SourceRegistry>,
+        repo_storage: Arc<dyn StorageBackend>,
         repo_key: &str,
         package_type: &str,
+        date_from: Option<&str>,
+        date_to: Option<&str>,
         conflict_resolution: ConflictResolution,
         include_metadata: bool,
         completed: &mut i32,
@@ -458,8 +502,11 @@ impl MigrationWorker {
                 break;
             }
 
-            // List artifacts with pagination
-            let artifacts = client.list_artifacts(repo_key, offset, limit).await?;
+            // List artifacts with pagination, optionally filtered to a date
+            // window for incremental / delta migration runs.
+            let artifacts = client
+                .list_artifacts_with_date_filter(repo_key, offset, limit, date_from, date_to)
+                .await?;
             pages_fetched += 1;
 
             let page_len = artifacts.results.len();
@@ -489,7 +536,7 @@ impl MigrationWorker {
                 // Artifact Keeper uses internally.
                 let item_checksum = expected_sha256.clone().or_else(|| expected_sha1.clone());
 
-                // Skip if already completed (resume support)
+                // Skip if already completed in THIS job (resume support within same job)
                 if self.is_item_already_completed(job_id, &source_path).await? {
                     *skipped += 1;
                     continue;
@@ -500,8 +547,13 @@ impl MigrationWorker {
                 // duplicates that already exist, which makes delta migrations work
                 let should_skip_duplicate = self
                     .check_artifact_duplicate(
+                        repo_key,
+                        &artifact_path,
                         &source_path,
-                        item_checksum.as_deref(),
+                        &ExpectedChecksums {
+                            sha256: expected_sha256.clone(),
+                            sha1: expected_sha1.clone(),
+                        },
                         conflict_resolution,
                     )
                     .await?;
@@ -539,6 +591,7 @@ impl MigrationWorker {
                 self.process_single_artifact(
                     item_id,
                     client.clone(),
+                    repo_storage.clone(),
                     repo_key,
                     package_type,
                     &artifact_path,
@@ -626,6 +679,7 @@ impl MigrationWorker {
         &self,
         item_id: Uuid,
         client: Arc<dyn SourceRegistry>,
+        repo_storage: Arc<dyn StorageBackend>,
         repo_key: &str,
         package_type: &str,
         artifact_path: &str,
@@ -639,13 +693,14 @@ impl MigrationWorker {
         skipped: &mut i32,
         transferred: &mut i64,
     ) -> Result<(), MigrationError> {
-        // Prefer sha256 for duplicate detection since that is what Artifact
-        // Keeper stores internally. Fall back to sha1 when the source only
-        // provides that (common for older Nexus artifacts).
-        let dedup_checksum = expected.sha256.clone().or_else(|| expected.sha1.clone());
-
         let should_skip = self
-            .check_artifact_duplicate(source_path, dedup_checksum.as_deref(), conflict_resolution)
+            .check_artifact_duplicate(
+                repo_key,
+                artifact_path,
+                source_path,
+                &expected,
+                conflict_resolution,
+            )
             .await?;
 
         if should_skip {
@@ -659,6 +714,7 @@ impl MigrationWorker {
         match self
             .transfer_artifact(
                 client,
+                repo_storage,
                 repo_key,
                 package_type,
                 artifact_path,
@@ -829,27 +885,50 @@ impl MigrationWorker {
     /// Check if an artifact already exists with the same checksum
     async fn check_artifact_duplicate(
         &self,
-        path: &str,
-        checksum: Option<&str>,
+        repo_key: &str,
+        artifact_path: &str,
+        legacy_source_path: &str,
+        expected: &ExpectedChecksums,
         conflict_resolution: ConflictResolution,
     ) -> Result<bool, MigrationError> {
-        // Check if an artifact with this path already exists
-        let existing: Option<(String,)> = sqlx::query_as(
-            "SELECT checksum_sha256 FROM artifacts WHERE path = $1 AND is_deleted = false LIMIT 1",
+        // Match artifacts in the same repository by repository-relative path.
+        // Keep a fallback for legacy rows where path was saved as repo-prefixed.
+        let existing: Option<(String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT a.checksum_sha256, a.checksum_sha1
+            FROM artifacts a
+            JOIN repositories r ON r.id = a.repository_id
+            WHERE r.key = $1
+              AND a.is_deleted = false
+              AND (a.path = $2 OR a.path = $3)
+            ORDER BY CASE WHEN a.path = $2 THEN 0 ELSE 1 END
+            LIMIT 1
+            "#,
         )
-        .bind(path)
+        .bind(repo_key)
+        .bind(artifact_path)
+        .bind(legacy_source_path)
         .fetch_optional(&self.db)
         .await?;
 
         match existing {
             None => Ok(false), // No duplicate
-            Some((existing_checksum,)) => match conflict_resolution {
+            Some((existing_sha256, existing_sha1)) => match conflict_resolution {
                 ConflictResolution::Skip => {
-                    // Skip if checksums match (identical content)
-                    Ok(checksum.map_or(true, |c| c == existing_checksum))
+                    // Prefer strong digest match (sha256). If source only has sha1,
+                    // compare against stored sha1 when available; otherwise treat as
+                    // duplicate-by-path to avoid full remigration loops.
+                    if let Some(expected_sha256) = expected.sha256.as_deref() {
+                        Ok(expected_sha256 == existing_sha256)
+                    } else if let Some(expected_sha1) = expected.sha1.as_deref() {
+                        Ok(existing_sha1.as_deref().map_or(true, |s| s == expected_sha1))
+                    } else {
+                        Ok(true)
+                    }
                 }
                 ConflictResolution::Overwrite => Ok(false), // Always process
-                ConflictResolution::Rename => Ok(false),    // Always process (will rename)
+                // Rename is currently treated as overwrite in migration.
+                ConflictResolution::Rename => Ok(false),
             },
         }
     }
@@ -884,6 +963,7 @@ impl MigrationWorker {
     async fn transfer_artifact(
         &self,
         client: Arc<dyn SourceRegistry>,
+        repo_storage: Arc<dyn StorageBackend>,
         repo_key: &str,
         package_type: &str,
         artifact_path: &str,
@@ -1020,7 +1100,7 @@ impl MigrationWorker {
 
         if !self.config.dry_run {
             // Check if content already exists (deduplication)
-            let exists = self.storage.exists(&storage_key).await.unwrap_or(false);
+            let exists = repo_storage.exists(&storage_key).await.unwrap_or(false);
             if !exists {
                 // Open the temp file as a `ReaderStream` and hand it to
                 // `put_stream` so the upload itself is memory-bounded. The
@@ -1109,8 +1189,8 @@ impl MigrationWorker {
                 }
                 sqlx::query(
                     r#"
-                    INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, storage_key, content_type)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, 'application/octet-stream')
+                    INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, checksum_sha1, storage_key, content_type)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'application/octet-stream')
                     ON CONFLICT (repository_id, path) WHERE is_deleted = false DO NOTHING
                     "#,
                 )
@@ -1120,6 +1200,7 @@ impl MigrationWorker {
                 .bind(parsed.version.as_deref())
                 .bind(content_size as i64)
                 .bind(&sha256_hex)
+                .bind(&sha1_hex)
                 .bind(&storage_key)
                 .execute(&self.db)
                 .await?;
@@ -1163,7 +1244,7 @@ impl MigrationWorker {
             size = content_size,
             sha256 = %sha256_hex,
             sha1 = %sha1_hex,
-            "Artifact transferred"
+            "Artifact transferred via streaming (no memory buffering)"
         );
 
         Ok(TransferResult {
@@ -1607,6 +1688,35 @@ struct TransferResult {
     calculated_sha256: Option<String>,
     calculated_sha1: Option<String>,
     metadata: Option<std::collections::HashMap<String, Vec<String>>>,
+}
+
+/// Guard to ensure temporary files are cleaned up on drop.
+/// Prevents accumulation of temp files from interrupted or failed migrations.
+struct TempFileGuard {
+    path: std::path::PathBuf,
+}
+
+impl TempFileGuard {
+    fn new(path: &std::path::Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        // Attempt cleanup on drop, but don't fail the migration if removal fails
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = ?self.path,
+                    error = %e,
+                    "Failed to delete temporary migration file"
+                );
+            }
+        }
+    }
 }
 
 /// Digests that the source registry declared for an artifact.
