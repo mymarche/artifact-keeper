@@ -122,6 +122,7 @@ async fn create_key(
     Extension(auth): Extension<AuthExtension>,
     Json(payload): Json<CreateKeyPayload>,
 ) -> Result<Json<SigningKeyPublic>> {
+    auth.require_admin()?;
     let svc = signing_service(&state);
     let key = svc
         .create_key(CreateKeyRequest {
@@ -181,9 +182,10 @@ async fn get_key(
 )]
 async fn delete_key(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(key_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>> {
+    auth.require_admin()?;
     let svc = signing_service(&state);
     svc.delete_key(key_id).await?;
     Ok(Json(serde_json::json!({"deleted": true})))
@@ -336,10 +338,11 @@ async fn get_repo_signing_config(
 )]
 async fn update_repo_signing_config(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(repo_id): Path<Uuid>,
     Json(payload): Json<UpdateSigningConfigPayload>,
 ) -> Result<Json<RepositorySigningConfig>> {
+    auth.require_admin()?;
     let svc = signing_service(&state);
 
     // Get existing config to merge with updates
@@ -424,7 +427,64 @@ pub struct SigningApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::middleware::auth::AuthExtension;
     use serde_json;
+
+    // -----------------------------------------------------------------------
+    // Admin gate on signing-key and repo-config mutation
+    // -----------------------------------------------------------------------
+
+    fn non_admin_jwt() -> AuthExtension {
+        // A non-admin JWT session: `is_api_token = false`, so scope checks do
+        // not apply and the admin gate is the only thing standing between the
+        // caller and a key mint / config write.
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "victor".to_string(),
+            email: "victor@example.com".to_string(),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    fn admin_jwt() -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "admin".to_string(),
+            email: "admin@example.com".to_string(),
+            is_admin: true,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    #[test]
+    fn test_non_admin_blocked_from_managing_signing_keys() {
+        // Regression: minting/deleting a repository signing key or writing the
+        // repo signing config subverts the artifact-signing trust model, so it
+        // must be admin-only. create_key, delete_key, and
+        // update_repo_signing_config all call `auth.require_admin()?` before
+        // touching the service; pin that decision at the predicate level
+        // (no DB needed). A non-admin JWT must be rejected with 403.
+        let ext = non_admin_jwt();
+        match ext.require_admin() {
+            Err(AppError::Authorization(_)) => {}
+            other => panic!("expected 403 Authorization for non-admin, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_admin_allowed_to_manage_signing_keys() {
+        // Legitimate use: an admin passes the same gate the three mutation
+        // handlers enforce, so signing-key management still works.
+        let ext = admin_jwt();
+        assert!(ext.require_admin().is_ok());
+    }
 
     // -----------------------------------------------------------------------
     // ListKeysQuery deserialization
