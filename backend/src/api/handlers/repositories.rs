@@ -7370,6 +7370,75 @@ mod tests {
         }
     }
 
+    /// Admin variant of [`make_auth_ext`]: an authenticated admin with no
+    /// repository-scope restriction. Admins bypass per-repo authorization.
+    fn make_admin_auth_ext() -> AuthExtension {
+        let mut ext = make_auth_ext(None);
+        ext.is_admin = true;
+        ext
+    }
+
+    #[tokio::test]
+    async fn test_require_visible_private_admin_bypasses_grant() {
+        // Admins bypass the per-repo grant lookup, so this short-circuits
+        // before any DB access and remains DB-free.
+        let repo = make_repo(false);
+        let auth = Some(make_admin_auth_ext());
+        let svc = RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool());
+        assert!(
+            require_visible(&repo, &auth, &svc).await.is_ok(),
+            "admin must see a private repo without an explicit grant"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // require_repo_write_access (authz-private-repo-membership)
+    //
+    // Write/delete authorization on a repository. The public-repo and admin
+    // arms short-circuit before the grant lookup, so they are DB-free. The
+    // private + non-admin grant lookup is covered by
+    // `repository_service::tests::test_user_can_access_repo_private_grant_enforced`.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_require_repo_write_access_public_ok() {
+        let repo = make_repo(true);
+        let auth = make_auth_ext(None);
+        let svc = RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool());
+        assert!(
+            require_repo_write_access(&auth, &repo, &svc).await.is_ok(),
+            "any authenticated caller may write to a public repo"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_require_repo_write_access_admin_ok() {
+        let repo = make_repo(false);
+        let auth = make_admin_auth_ext();
+        let svc = RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool());
+        assert!(
+            require_repo_write_access(&auth, &repo, &svc).await.is_ok(),
+            "admin may write to a private repo without an explicit grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_require_repo_write_access_token_scope_denied() {
+        // The token-scope check runs first and rejects a repository-scoped
+        // token that does not list this repo, before the grant lookup, so this
+        // remains DB-free.
+        let repo = make_repo(false);
+        let other_repo_id = Uuid::new_v4();
+        let auth = make_auth_ext(Some(vec![other_repo_id]));
+        let svc = RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool());
+        let result = require_repo_write_access(&auth, &repo, &svc).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::Authorization(msg) => assert!(msg.contains("does not have access")),
+            other => panic!("Expected Authorization error, got: {:?}", other),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // validate_cache_ttl
     // -----------------------------------------------------------------------
