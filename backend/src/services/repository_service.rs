@@ -28,6 +28,9 @@ pub struct CreateRepositoryRequest {
     pub upstream_url: Option<String>,
     pub is_public: bool,
     pub quota_bytes: Option<i64>,
+    /// When true, direct user uploads are rejected (artifacts must arrive via
+    /// the promotion path). Defaults to false.
+    pub promotion_only: bool,
     /// Custom format key for WASM plugin handlers (e.g. "rpm-custom").
     pub format_key: Option<String>,
 }
@@ -41,6 +44,8 @@ pub struct UpdateRepositoryRequest {
     pub is_public: Option<bool>,
     pub quota_bytes: Option<Option<i64>>,
     pub upstream_url: Option<String>,
+    /// When `Some`, sets the `promotion_only` flag; `None` leaves it unchanged.
+    pub promotion_only: Option<bool>,
 }
 
 /// Controls which repositories a caller can see in listing results.
@@ -488,15 +493,15 @@ impl RepositoryService {
             INSERT INTO repositories (
                 key, name, description, format, repo_type,
                 storage_backend, storage_path, upstream_url,
-                is_public, quota_bytes
+                is_public, quota_bytes, promotion_only
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING
                 id, key, name, description,
                 format as "format: RepositoryFormat",
                 repo_type as "repo_type: RepositoryType",
                 storage_backend, storage_path, upstream_url,
-                is_public, quota_bytes,
+                is_public, quota_bytes, promotion_only,
                 replication_priority as "replication_priority: ReplicationPriority",
                 promotion_target_id, promotion_policy_id,
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
@@ -513,6 +518,7 @@ impl RepositoryService {
             req.upstream_url,
             req.is_public,
             req.quota_bytes,
+            req.promotion_only,
         )
         .fetch_one(&mut *tx)
         .await;
@@ -579,7 +585,7 @@ impl RepositoryService {
                 format as "format: RepositoryFormat",
                 repo_type as "repo_type: RepositoryType",
                 storage_backend, storage_path, upstream_url,
-                is_public, quota_bytes,
+                is_public, quota_bytes, promotion_only,
                 replication_priority as "replication_priority: ReplicationPriority",
                 promotion_target_id, promotion_policy_id,
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
@@ -608,7 +614,7 @@ impl RepositoryService {
                 format as "format: RepositoryFormat",
                 repo_type as "repo_type: RepositoryType",
                 storage_backend, storage_path, upstream_url,
-                is_public, quota_bytes,
+                is_public, quota_bytes, promotion_only,
                 replication_priority as "replication_priority: ReplicationPriority",
                 promotion_target_id, promotion_policy_id,
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
@@ -652,7 +658,7 @@ impl RepositoryService {
                 id, key, name, description,
                 format, repo_type,
                 storage_backend, storage_path, upstream_url,
-                is_public, quota_bytes,
+                is_public, quota_bytes, promotion_only,
                 replication_priority,
                 promotion_target_id, promotion_policy_id,
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
@@ -722,6 +728,7 @@ impl RepositoryService {
                 is_public = COALESCE($5, is_public),
                 quota_bytes = COALESCE($6, quota_bytes),
                 upstream_url = COALESCE($7, upstream_url),
+                promotion_only = COALESCE($8, promotion_only),
                 updated_at = NOW()
             WHERE id = $1
             RETURNING
@@ -729,7 +736,7 @@ impl RepositoryService {
                 format as "format: RepositoryFormat",
                 repo_type as "repo_type: RepositoryType",
                 storage_backend, storage_path, upstream_url,
-                is_public, quota_bytes,
+                is_public, quota_bytes, promotion_only,
                 replication_priority as "replication_priority: ReplicationPriority",
                 promotion_target_id, promotion_policy_id,
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
@@ -742,7 +749,8 @@ impl RepositoryService {
             req.description,
             req.is_public,
             req.quota_bytes.flatten(),
-            req.upstream_url
+            req.upstream_url,
+            req.promotion_only,
         )
         .fetch_optional(&self.db)
         .await
@@ -1091,7 +1099,7 @@ impl RepositoryService {
                 r.format as "format: RepositoryFormat",
                 r.repo_type as "repo_type: RepositoryType",
                 r.storage_backend, r.storage_path, r.upstream_url,
-                r.is_public, r.quota_bytes,
+                r.is_public, r.quota_bytes, r.promotion_only,
                 r.replication_priority as "replication_priority: ReplicationPriority",
                 r.promotion_target_id, r.promotion_policy_id,
                 r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,
@@ -1221,6 +1229,7 @@ mod tests {
             upstream_url: None,
             is_public: true,
             quota_bytes: Some(1024 * 1024 * 1024),
+            promotion_only: false,
             replication_priority: ReplicationPriority::Scheduled,
             promotion_target_id: None,
             promotion_policy_id: None,
@@ -1289,6 +1298,7 @@ mod tests {
             upstream_url: None,
             is_public: false,
             quota_bytes: None,
+            promotion_only: false,
             replication_priority: ReplicationPriority::LocalOnly,
             promotion_target_id: None,
             promotion_policy_id: None,
@@ -1355,6 +1365,7 @@ mod tests {
             upstream_url: None,
             is_public: true,
             quota_bytes: Some(1_000_000_000),
+            promotion_only: false,
             format_key: None,
         };
         assert_eq!(req.key, "my-repo");
@@ -1377,6 +1388,7 @@ mod tests {
             upstream_url: Some("https://registry.npmjs.org".to_string()),
             is_public: false,
             quota_bytes: None,
+            promotion_only: false,
             format_key: None,
         };
         assert_eq!(
@@ -1399,6 +1411,7 @@ mod tests {
             is_public: None,
             quota_bytes: None,
             upstream_url: None,
+            promotion_only: None,
         };
         assert!(req.key.is_none());
         assert!(req.name.is_none());
@@ -1417,6 +1430,7 @@ mod tests {
             is_public: Some(false),
             quota_bytes: Some(Some(2_000_000_000)),
             upstream_url: None,
+            promotion_only: None,
         };
         assert_eq!(req.name, Some("Updated Name".to_string()));
         assert_eq!(req.is_public, Some(false));
@@ -1433,6 +1447,7 @@ mod tests {
             is_public: None,
             quota_bytes: Some(None),
             upstream_url: None,
+            promotion_only: None,
         };
         assert_eq!(req.quota_bytes, Some(None));
     }
@@ -2305,6 +2320,7 @@ mod tests {
                 upstream_url: None,
                 is_public: false,
                 quota_bytes: None,
+                promotion_only: false,
                 format_key: None,
             }
         }
