@@ -40,6 +40,17 @@ pub async fn try_pool() -> Option<PgPool> {
         .ok()
 }
 
+/// Build a lazily-connecting pool that never actually opens a connection
+/// unless a query is issued. Useful for DB-free unit tests of code paths that
+/// short-circuit before touching the database.
+pub fn lazy_pool() -> PgPool {
+    let url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://invalid:invalid@127.0.0.1:1/none".to_string());
+    sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy(&url)
+        .expect("lazy pool")
+}
+
 fn cfg(storage_path: &str) -> Config {
     Config {
         database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
