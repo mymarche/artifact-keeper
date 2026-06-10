@@ -827,4 +827,158 @@ mod tests {
         assert_eq!(json["pagination"]["per_page"], 24);
         assert_eq!(json["pagination"]["total"], 0);
     }
+
+    // -----------------------------------------------------------------------
+    // DB-backed visibility tests: the listing/detail/versions endpoints must
+    // enforce per-user repository visibility (skip cleanly without
+    // DATABASE_URL, same as the other handler suites).
+    // -----------------------------------------------------------------------
+    mod visibility_db {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        /// Insert a minimal `packages` row in `repo_id` and return its id.
+        async fn seed_package(pool: &sqlx::PgPool, repo_id: Uuid) -> Uuid {
+            sqlx::query_scalar(
+                "INSERT INTO packages (repository_id, name, version, size_bytes) \
+                 VALUES ($1, 'vis-test-pkg', '1.0.0', 1) RETURNING id",
+            )
+            .bind(repo_id)
+            .fetch_one(pool)
+            .await
+            .expect("seed package")
+        }
+
+        async fn set_repo_public(pool: &sqlx::PgPool, repo_id: Uuid) {
+            sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+                .bind(repo_id)
+                .execute(pool)
+                .await
+                .expect("set is_public");
+        }
+
+        /// Build the packages router with `auth` injected (None = anonymous).
+        fn app_for(f: &tdh::Fixture, auth: Option<AuthExtension>) -> axum::Router {
+            match auth {
+                Some(a) => tdh::router_with_auth(router(), f.state.clone(), a),
+                None => f.router_anon(router()),
+            }
+        }
+
+        /// How many packages of the fixture repo the caller can see in the
+        /// listing (filtered by repository_key so parallel tests don't leak in).
+        async fn visible_total(f: &tdh::Fixture, auth: Option<AuthExtension>) -> i64 {
+            let (status, body) = tdh::send(
+                app_for(f, auth),
+                tdh::get(format!("/?repository_key={}", f.repo_key)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("listing json");
+            json["pagination"]["total"].as_i64().expect("total")
+        }
+
+        /// Status the caller gets for a packages-router GET (detail/versions).
+        async fn status_of(
+            f: &tdh::Fixture,
+            auth: Option<AuthExtension>,
+            path: String,
+        ) -> StatusCode {
+            let (status, _) = tdh::send(app_for(f, auth), tdh::get(path)).await;
+            status
+        }
+
+        #[tokio::test]
+        async fn test_private_repo_packages_hidden_without_access() {
+            // create_repo leaves is_public at its default (false): private.
+            let Some(f) = tdh::Fixture::setup("local", "npm").await else {
+                return;
+            };
+            let pkg = seed_package(&f.pool, f.repo_id).await;
+            // A user with no role assignment on the repo.
+            let outsider = || Some(make_auth(Uuid::new_v4(), false, None));
+
+            assert_eq!(visible_total(&f, None).await, 0);
+            assert_eq!(visible_total(&f, outsider()).await, 0);
+            assert_eq!(
+                status_of(&f, None, format!("/{pkg}")).await,
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                status_of(&f, outsider(), format!("/{pkg}")).await,
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                status_of(&f, outsider(), format!("/{pkg}/versions")).await,
+                StatusCode::NOT_FOUND
+            );
+            f.teardown().await;
+        }
+
+        #[tokio::test]
+        async fn test_private_repo_packages_visible_with_grant_or_admin() {
+            let Some(f) = tdh::Fixture::setup("local", "npm").await else {
+                return;
+            };
+            let pkg = seed_package(&f.pool, f.repo_id).await;
+            // Fixture::setup grants the fixture user a repo-scoped role.
+            let granted = || Some(make_auth(f.user_id, false, None));
+            let admin = || Some(make_auth(Uuid::new_v4(), true, None));
+
+            assert_eq!(visible_total(&f, granted()).await, 1);
+            assert_eq!(visible_total(&f, admin()).await, 1);
+            assert_eq!(
+                status_of(&f, granted(), format!("/{pkg}")).await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                status_of(&f, admin(), format!("/{pkg}")).await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                status_of(&f, granted(), format!("/{pkg}/versions")).await,
+                StatusCode::OK
+            );
+            f.teardown().await;
+        }
+
+        #[tokio::test]
+        async fn test_public_repo_packages_visible_to_anonymous() {
+            let Some(f) = tdh::Fixture::setup("local", "npm").await else {
+                return;
+            };
+            let pkg = seed_package(&f.pool, f.repo_id).await;
+            set_repo_public(&f.pool, f.repo_id).await;
+
+            assert_eq!(visible_total(&f, None).await, 1);
+            assert_eq!(status_of(&f, None, format!("/{pkg}")).await, StatusCode::OK);
+            f.teardown().await;
+        }
+
+        #[tokio::test]
+        async fn test_repo_scoped_token_limited_to_allowed_repos() {
+            let Some(f) = tdh::Fixture::setup("local", "npm").await else {
+                return;
+            };
+            let pkg = seed_package(&f.pool, f.repo_id).await;
+            let scoped_to = |ids: Vec<Uuid>| Some(make_auth(f.user_id, false, Some(ids)));
+
+            // Token scoped to a different repository: nothing visible, even
+            // though the underlying user holds a grant on the fixture repo.
+            assert_eq!(visible_total(&f, scoped_to(vec![Uuid::new_v4()])).await, 0);
+            assert_eq!(
+                status_of(&f, scoped_to(vec![Uuid::new_v4()]), format!("/{pkg}")).await,
+                StatusCode::NOT_FOUND
+            );
+
+            // Token scoped to the fixture repository: visible.
+            assert_eq!(visible_total(&f, scoped_to(vec![f.repo_id])).await, 1);
+            assert_eq!(
+                status_of(&f, scoped_to(vec![f.repo_id]), format!("/{pkg}")).await,
+                StatusCode::OK
+            );
+            f.teardown().await;
+        }
+    }
 }
