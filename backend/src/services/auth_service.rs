@@ -80,6 +80,17 @@ pub struct Claims {
     pub is_admin: bool,
     /// Issued at (Unix timestamp)
     pub iat: i64,
+    /// Issued-at in **milliseconds** (sub-second precision). Private,
+    /// non-standard claim added in 1.2.1 to resolve the same-second
+    /// credential-invalidation race (#1915/#1933): the standard RFC-7519
+    /// `iat` is whole seconds, too coarse to order a token against a
+    /// millisecond credential-change watermark that falls in the same second.
+    ///
+    /// `Option` for backward compatibility: tokens minted before this deploy
+    /// have no `iat_ms`. Consumers MUST fall back to `iat * 1000` (the floored,
+    /// conservative value) when absent — see `effective_iat_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iat_ms: Option<i64>,
     /// Expiration time (Unix timestamp)
     pub exp: i64,
     /// Token type: "access" or "refresh"
@@ -92,6 +103,18 @@ pub struct Claims {
     /// family. Set on refresh tokens only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub family_id: Option<Uuid>,
+}
+
+impl Claims {
+    /// Millisecond issued-at used for credential-invalidation ordering.
+    /// Falls back to `iat * 1000` (floored to the second) for legacy tokens
+    /// minted before the `iat_ms` claim existed. The floored fallback is the
+    /// conservative/secure side: a legacy same-second token is treated as
+    /// minted at the *start* of its second, so a same-second credential change
+    /// (full-ms watermark) still rejects it.
+    pub fn effective_iat_ms(&self) -> i64 {
+        self.iat_ms.unwrap_or_else(|| self.iat.saturating_mul(1000))
+    }
 }
 
 /// Token pair response
@@ -148,15 +171,26 @@ struct CachedApiTokenEntry {
 
 /// In-memory fast-path cache for the DB-backed credential-invalidation
 /// check. The value is the highest of `users.password_changed_at` and
-/// `users.totp_verified_at` (as a Unix timestamp) plus the `Instant` it
-/// was cached so entries can expire after [`CREDENTIAL_DB_CACHE_TTL_SECS`].
+/// `users.totp_verified_at` (as a Unix timestamp in **milliseconds**) plus
+/// the `Instant` it was cached so entries can expire after
+/// [`CREDENTIAL_DB_CACHE_TTL_SECS`].
 /// `users.updated_at` is deliberately NOT folded into the watermark — it
 /// bumps on benign profile edits (display name, email, role) so including
 /// it would invalidate tokens on changes that are not credential-bearing
 /// (regression caught in PR #1190 review). Process-local; DB is the
 /// source of truth so multi-replica deployments stay consistent (#1173).
+///
+/// The `i64` watermark is in **milliseconds** (sub-second precision) and is
+/// compared against the token's millisecond issued-at
+/// (`Claims::effective_iat_ms`): a real credential change happens strictly
+/// after the token was minted, so its `password_changed_at` carries a positive
+/// millisecond offset above the token's `iat_ms` and the token is rejected even
+/// when both fall in the same wall-clock second. Legacy tokens without `iat_ms`
+/// fall back to the floored `iat * 1000` (conservative side).
 static CREDENTIAL_INVALIDATIONS: OnceLock<RwLock<HashMap<Uuid, (i64, Instant)>>> = OnceLock::new();
-const INVALIDATION_RETENTION_SECS: i64 = 7 * 24 * 3600;
+/// Retention window for in-memory watermarks, in **milliseconds** (matches
+/// the millisecond watermark unit).
+const INVALIDATION_RETENTION_MS: i64 = 7 * 24 * 3600 * 1000;
 /// How long a DB-backed credential-change watermark stays cached in the
 /// in-memory fast-path. 5 s is short enough that an invalidation on
 /// another replica is observed by every other replica almost immediately
@@ -174,47 +208,68 @@ fn invalidation_map() -> &'static RwLock<HashMap<Uuid, (i64, Instant)>> {
 /// The DB columns (`password_changed_at`, `totp_verified_at`, `updated_at`)
 /// remain the source of truth across replicas.
 ///
-/// Boundary (regression of #931, fixed by #1436): the replica-safe path in
-/// `is_token_invalidated_replica_safe` compares with strict `<` (#1265),
-/// not `<=`. A JWT minted in the same wall-clock second as the password
-/// change would otherwise survive: `iat == watermark` makes `iat < watermark`
-/// false. We write `now + 1` so any token with `iat <= now` is rejected.
-/// The sync map at `is_token_invalidated` uses `<=` so the `+1` does not
-/// double-count there.
+/// The watermark is set to `Utc::now().timestamp_millis()` (full millisecond
+/// precision) — the **mint-then-invalidate** variant used by password change,
+/// password reset and deactivation. Because the credential change happens
+/// strictly after any pre-change token was minted, the watermark carries a
+/// positive sub-second offset above the token's `iat_ms`, so even a token
+/// minted in the same wall-clock second is rejected by the replica-safe strict
+/// `<`. The **invalidate-then-mint** case (OIDC login / admin reset that mints
+/// in the same request) also uses this full-millisecond variant: the fresh JWT
+/// is minted microseconds AFTER the invalidate, so its `iat_ms` is strictly
+/// greater than this watermark and survives strict `<` — no floor-second
+/// special case is needed now that the token carries millisecond precision.
 pub fn invalidate_user_tokens(user_id: Uuid) {
-    let watermark = Utc::now().timestamp().saturating_add(1);
-    invalidate_user_tokens_at(user_id, watermark);
+    let watermark_ms = Utc::now().timestamp_millis();
+    invalidate_user_tokens_at(user_id, watermark_ms);
 }
 
 /// Variant of [`invalidate_user_tokens`] that exempts the caller's own JWT.
 ///
-/// `caller_iat` is the calling token's issued-at (seconds). The in-memory
-/// watermark is set to `caller_iat - 1` so the sync `<=` check still passes
-/// for the calling token (`caller_iat <= caller_iat - 1` is false), while
-/// every token issued at any second strictly before `caller_iat` is
-/// invalidated. The sync path is the one consulted by the gRPC interceptor
-/// (`grpc/auth_interceptor.rs`) and the TOTP causation tests, so the `-1`
-/// here is load-bearing on those code paths.
+/// `caller_iat_ms` is the calling token's millisecond issued-at
+/// ([`Claims::effective_iat_ms`]). The in-memory watermark is set to
+/// `caller_iat_ms - 1` so the sync `<=` check still passes for the calling
+/// token (`caller_iat_ms <= caller_iat_ms - 1` is false) while EVERY strictly-
+/// older token (`iat_ms <= caller_iat_ms - 1`) is invalidated — now precise to
+/// the millisecond, so an older token from the SAME second is also caught. (The
+/// previous seconds-granularity offset `caller_iat * 1000 - 1` exempted every
+/// other token minted earlier in the caller's own second; ms precision closes
+/// that leak.) The sync path is the one consulted by the gRPC interceptor
+/// (`grpc/auth_interceptor.rs`) and the TOTP causation tests, so the
+/// exempt-caller offset here is load-bearing on those code paths.
 ///
 /// Used by TOTP enable/disable so the session that initiated the credential
 /// change is not logged out by the same operation. Other sessions (and any
 /// stolen pre-change tokens) are still killed. The refresh-grant bypass
 /// from #1146 is closed separately by the caller via
 /// [`AuthService::revoke_all_refresh_token_families`].
-pub fn invalidate_user_tokens_except_caller(user_id: Uuid, caller_iat: i64) {
-    // -1 so the sync `<=` check at the line `issued_at <= changed_at` lets
-    // the calling token through. Older tokens (iat <= caller_iat - 1) are
-    // still caught.
-    invalidate_user_tokens_at(user_id, caller_iat.saturating_sub(1));
+pub fn invalidate_user_tokens_except_caller(user_id: Uuid, caller_iat_ms: i64) {
+    // `caller_iat_ms - 1` (ms) so the sync `<=` check at the line
+    // `issued_at_ms <= changed_at` lets the calling token through while every
+    // strictly-older token (including an older same-second one) is caught.
+    let watermark_ms = caller_iat_ms.saturating_sub(1);
+    invalidate_user_tokens_at(user_id, watermark_ms);
 }
 
-/// Set the in-memory watermark to a specific epoch second. Shared by the
-/// "invalidate everything" and "exempt caller" variants above.
-fn invalidate_user_tokens_at(user_id: Uuid, watermark: i64) {
+/// Set the in-memory watermark to a specific epoch **millisecond**. Shared by
+/// the "invalidate everything", "floor second" and "exempt caller" variants
+/// above.
+///
+/// The write is **monotonic**: an existing entry is only raised, never
+/// lowered. This prevents a late stale DB fetch (or a lower-precision
+/// invalidate) from clobbering a higher watermark already recorded by a
+/// password change on this replica (cross-replica / >5s-cache hardening).
+fn invalidate_user_tokens_at(user_id: Uuid, watermark_ms: i64) {
     if let Ok(mut map) = invalidation_map().write() {
-        map.insert(user_id, (watermark, Instant::now()));
-        let now = Utc::now().timestamp();
-        let cutoff = now - INVALIDATION_RETENTION_SECS;
+        let now = Instant::now();
+        map.entry(user_id)
+            .and_modify(|e| {
+                if watermark_ms > e.0 {
+                    *e = (watermark_ms, now);
+                }
+            })
+            .or_insert((watermark_ms, now));
+        let cutoff = Utc::now().timestamp_millis() - INVALIDATION_RETENTION_MS;
         map.retain(|_, (ts, _)| *ts > cutoff);
     }
 }
@@ -222,10 +277,11 @@ fn invalidate_user_tokens_at(user_id: Uuid, watermark: i64) {
 /// In-memory fast-path version of the credential-invalidation check.
 ///
 /// Returns `true` only when this replica has seen an `invalidate_user_tokens`
-/// call whose watermark is `>=` the token's `iat`. Comparison is `<=` so a
-/// token minted in the same wall-clock second as the invalidation is
-/// rejected too (1-second JWT `iat` resolution race; fixes the boundary
-/// bug at the old line 152).
+/// call whose watermark is `>=` the token's millisecond issued-at
+/// (`issued_at_ms`, resolved by the caller via `Claims::effective_iat_ms`).
+/// Comparison is `<=` so a token minted at the exact watermark instant is
+/// rejected too; with millisecond resolution on both sides this no longer
+/// over-rejects a same-second-but-later token.
 ///
 /// Callers
 /// -------
@@ -250,10 +306,14 @@ fn invalidate_user_tokens_at(user_id: Uuid, watermark: i64) {
 /// `refresh_tokens` consults the DB via [`is_user_credentials_changed_db`].
 /// The DB-backed check is the source of truth; this exists only as the
 /// fast-path for the same replica.
-pub(crate) fn is_token_invalidated(user_id: Uuid, issued_at: i64) -> bool {
+pub(crate) fn is_token_invalidated(user_id: Uuid, issued_at_ms: i64) -> bool {
     if let Ok(map) = invalidation_map().read() {
-        if let Some(&(changed_at, _)) = map.get(&user_id) {
-            return issued_at <= changed_at;
+        if let Some(&(changed_at_ms, _)) = map.get(&user_id) {
+            // `issued_at_ms` is the token's millisecond issued-at (resolved by
+            // the caller via `Claims::effective_iat_ms`); the watermark is in
+            // milliseconds too. Sync plane keeps `<=` (see #1248 distinction at
+            // `is_token_invalidated_replica_safe`).
+            return issued_at_ms <= changed_at_ms;
         }
     }
     false
@@ -262,8 +322,11 @@ pub(crate) fn is_token_invalidated(user_id: Uuid, issued_at: i64) -> bool {
 /// Outcome of the DB-backed credential-change lookup for a user.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CredentialWatermark {
-    /// Unix-timestamp (seconds) of the most recent credential-bearing
-    /// change on the user row.
+    /// Unix-timestamp (**milliseconds**) of the most recent credential-bearing
+    /// change on the user row. Millisecond precision preserves the sub-second
+    /// component of `password_changed_at` (microsecond TIMESTAMPTZ) so a token
+    /// minted in the same wall-clock second as a credential change is ordered
+    /// correctly against the watermark.
     pub(crate) watermark: i64,
     /// `users.is_active`. When `false`, [`is_token_invalidated_replica_safe`]
     /// rejects every token regardless of `iat` so a deactivation processed
@@ -275,8 +338,8 @@ pub(crate) struct CredentialWatermark {
 /// every `validate_access_token_async` / `refresh_tokens` call.
 ///
 /// Returns the highest of `users.password_changed_at` and
-/// `users.totp_verified_at` as a Unix timestamp (in seconds), alongside
-/// `users.is_active`, or `None` if the user no longer exists.
+/// `users.totp_verified_at` as a Unix timestamp (in **milliseconds**),
+/// alongside `users.is_active`, or `None` if the user no longer exists.
 ///
 /// Note: `users.updated_at` is deliberately NOT included. Profile edits
 /// (display name, email, last_login_at touches) bump `updated_at` without
@@ -337,7 +400,16 @@ async fn fetch_credential_change_watermark(
     let Some((watermark_ts, is_active)) = row else {
         return Ok(None);
     };
-    let watermark = watermark_ts.timestamp();
+    // Full-millisecond DB-derived watermark. With millisecond `iat_ms` in the
+    // token, a brand-new user's first login ALWAYS happens in wall-clock time
+    // strictly after user creation, so its `iat_ms` exceeds the creation
+    // watermark (`users.password_changed_at DEFAULT NOW()`, migration 076, e.g.
+    // ...787141) even at full precision — the floor-to-second workaround the
+    // #1173/rbac/mesh fresh-user "401" regression once required is no longer
+    // needed. Full precision is also strictly more correct cross-replica: a
+    // password change observed via the DB on a peer replica now rejects
+    // same-second pre-change tokens there too, which the floored value weakened.
+    let watermark = watermark_ts.timestamp_millis();
 
     // Only cache when the user is active. Caching `is_active=false` would
     // require expanding the cache value to a tuple; instead we skip the
@@ -345,11 +417,11 @@ async fn fetch_credential_change_watermark(
     // status. Inactive lookups are rare on the hot path (the request will
     // 401 anyway) so the extra DB roundtrip is acceptable.
     if is_active {
-        if let Ok(mut map) = invalidation_map().write() {
-            map.insert(user_id, (watermark, Instant::now()));
-            let cutoff = Utc::now().timestamp() - INVALIDATION_RETENTION_SECS;
-            map.retain(|_, (ts, _)| *ts > cutoff);
-        }
+        // Reuse the monotonic-max writer so a stale DB fetch on this replica
+        // can never lower a higher watermark already recorded by an explicit
+        // password-change invalidation (#1173 cross-replica hardening). The
+        // watermark is in milliseconds.
+        invalidate_user_tokens_at(user_id, watermark);
     }
 
     Ok(Some(CredentialWatermark {
@@ -361,25 +433,33 @@ async fn fetch_credential_change_watermark(
 /// Replica-safe credential-invalidation check.
 ///
 /// Returns `true` when the user's credentials have changed strictly after
-/// the token's `iat`. JWT `iat` is whole seconds (RFC 7519); the DB
-/// `password_changed_at` is microsecond-precision but
-/// [`fetch_credential_change_watermark`] truncates it to seconds via
-/// `.timestamp()`. We use strict `<` (not `<=`) so a token minted in the
-/// same wall-clock second as the watermark is accepted — this is the
-/// fresh-user case where `POST /users` sets `password_changed_at = NOW()`
-/// (column DEFAULT) and the user's first login mints a JWT whose `iat`
-/// also resolves to that second (#1173 follow-up: release-gate
-/// `rbac-tests` and `mesh-tests` saw HTTP 401 instead of the expected 403
-/// for fresh non-admin users).
+/// the token was minted. The token carries a millisecond issued-at
+/// (`Claims::effective_iat_ms`: the `iat_ms` claim, or `iat * 1000` floored for
+/// legacy tokens); the DB `password_changed_at` is microsecond-precision and
+/// [`fetch_credential_change_watermark`] preserves it at **millisecond**
+/// precision via `.timestamp_millis()`. We compare `issued_at_ms` against the
+/// millisecond watermark with strict `<` (not `<=`).
 ///
-/// Safety of `<` for the actual-password-change case: a JWT with `iat`
-/// equal to the post-change watermark would have to have been minted in
-/// the same wall-clock second the password was changed. The server
-/// requires a successful authentication to mint a JWT, so such a JWT
-/// could only have been minted with the OLD password right up until the
-/// password change — which means the attacker already had the old
-/// password and any JWT obtained that way is equivalent to one obtained
-/// a moment earlier through normal use. There is no exploitable window.
+/// Millisecond precision on BOTH sides resolves the same-second conflict that
+/// neither floor-second nor full-second token data could:
+///   * **mint-then-invalidate** (password change / reset / deactivation,
+///     [`invalidate_user_tokens`]): the change happens strictly after the token
+///     was minted, so the watermark carries a positive offset and a same-second
+///     pre-change token (`iat_ms < watermark_ms`) is **rejected** — the #931
+///     invariant.
+///   * **invalidate-then-mint** (OIDC login / admin reset): the fresh JWT is
+///     minted microseconds AFTER the invalidate, so `iat_ms > watermark_ms` and
+///     it survives strict `<`, while any pre-change token is rejected (#1911).
+///   * **fresh user** (`POST /users` sets `password_changed_at = NOW()`, first
+///     login mints later in real time): `iat_ms > watermark_ms` ⇒ accepted
+///     (#1173 follow-up).
+///
+/// Safety of `<`: the server requires a successful authentication to mint a
+/// JWT, so the only token that can have `iat_ms >= watermark` is one minted by
+/// a successful auth at or after the credential change. A pre-change token has
+/// `iat_ms < watermark` and is rejected to the millisecond. There is no
+/// exploitable window. Legacy tokens with no `iat_ms` fall back to the floored
+/// `iat * 1000`, the conservative side (rejected against a same-second change).
 ///
 /// Resolution order:
 ///   1. DB watermark, served from the in-memory cache when fresh
@@ -403,7 +483,7 @@ async fn fetch_credential_change_watermark(
 pub(crate) async fn is_token_invalidated_replica_safe(
     db: &PgPool,
     user_id: Uuid,
-    issued_at: i64,
+    issued_at_ms: i64,
 ) -> Result<bool> {
     match fetch_credential_change_watermark(db, user_id).await? {
         Some(entry) => {
@@ -414,10 +494,49 @@ pub(crate) async fn is_token_invalidated_replica_safe(
             if !entry.is_active {
                 return Ok(true);
             }
-            Ok(issued_at < entry.watermark)
+            // `issued_at_ms` is the token's millisecond issued-at (resolved by
+            // the caller via `Claims::effective_iat_ms`); `entry.watermark` is
+            // in milliseconds. Strict `<` (#1248 async-plane comparator): a
+            // pre-change token minted strictly before the credential change has
+            // `iat_ms < watermark` and is rejected, while a token minted (even
+            // microseconds) after — including an invalidate-then-mint fresh
+            // token in the same request — has `iat_ms > watermark` and survives.
+            Ok(issued_at_ms < entry.watermark)
         }
         None => Ok(false),
     }
+}
+
+/// Read the live server-side admin role for a user from the DB.
+///
+/// The JWT `is_admin` claim is client-supplied (modulo the HMAC signature) and
+/// must never be the authorization source of truth. Every admin gate consumes
+/// the validated `Claims`, so re-deriving `is_admin` here — at the validation
+/// chokepoint — makes the claim advisory and the DB role authoritative for all
+/// downstream consumers (HTTP middleware, OCI registry, gRPC) at once.
+///
+/// Returns:
+///   * `Ok(Some(is_admin))` — the live `users.is_admin` for an active user.
+///   * `Ok(None)`           — no active user row (deleted / deactivated). The
+///     caller MUST treat this as a failed authentication, never as admin.
+///
+/// Runtime `query_scalar` (not the `query!` macro) so this does not require
+/// regenerating the offline `.sqlx` cache. The lookup is an indexed primary-key
+/// read.
+pub(crate) async fn fetch_live_is_admin(db: &PgPool, user_id: Uuid) -> Result<Option<bool>> {
+    let row = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT is_admin
+        FROM users
+        WHERE id = $1 AND is_active = true
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(row)
 }
 
 /// Global record of users whose API-token cache entries have been forcibly
@@ -900,6 +1019,9 @@ impl AuthService {
     /// See [`AuthService::generate_tokens`] for the new-login case.
     pub fn generate_tokens_with_family(&self, user: &User, family_id: Uuid) -> Result<TokenPair> {
         let now = Utc::now();
+        // Capture the millisecond instant once so access and refresh tokens
+        // share the exact same `iat_ms` ordering anchor.
+        let now_ms = now.timestamp_millis();
         let access_exp = now + Duration::minutes(self.config.jwt_access_token_expiry_minutes);
         let refresh_exp = now + Duration::days(self.config.jwt_refresh_token_expiry_days);
 
@@ -909,6 +1031,7 @@ impl AuthService {
             email: user.email.clone(),
             is_admin: user.is_admin,
             iat: now.timestamp(),
+            iat_ms: Some(now_ms),
             exp: access_exp.timestamp(),
             token_type: "access".to_string(),
             jti: None,
@@ -922,6 +1045,7 @@ impl AuthService {
             email: user.email.clone(),
             is_admin: user.is_admin,
             iat: now.timestamp(),
+            iat_ms: Some(now_ms),
             exp: refresh_exp.timestamp(),
             token_type: "refresh".to_string(),
             jti: Some(refresh_jti),
@@ -1020,7 +1144,7 @@ impl AuthService {
             return Err(AppError::Authentication("Invalid token type".to_string()));
         }
 
-        if is_token_invalidated(token_data.claims.sub, token_data.claims.iat) {
+        if is_token_invalidated(token_data.claims.sub, token_data.claims.effective_iat_ms()) {
             return Err(AppError::Authentication(
                 "Token invalidated by credential change".to_string(),
             ));
@@ -1038,18 +1162,39 @@ impl AuthService {
     /// token-exchange) so a credential change on replica A is honored on
     /// replica B (#1173).
     pub async fn validate_access_token_async(&self, token: &str) -> Result<Claims> {
-        let token_data = self.decode_token(token)?;
+        let mut token_data = self.decode_token(token)?;
 
         if token_data.claims.token_type != "access" {
             return Err(AppError::Authentication("Invalid token type".to_string()));
         }
 
-        if is_token_invalidated_replica_safe(&self.db, token_data.claims.sub, token_data.claims.iat)
-            .await?
+        if is_token_invalidated_replica_safe(
+            &self.db,
+            token_data.claims.sub,
+            token_data.claims.effective_iat_ms(),
+        )
+        .await?
         {
             return Err(AppError::Authentication(
                 "Token invalidated by credential change".to_string(),
             ));
+        }
+
+        // Re-derive `is_admin` from the live server-side role. The JWT claim is
+        // client-supplied and must not be the authorization source of truth; a
+        // validly-signed token forged for a real low-priv subject with
+        // `is_admin:true` must NOT be granted admin. Overwriting here makes the
+        // claim advisory and the DB role authoritative for every downstream
+        // consumer of these claims (HTTP middleware, OCI, gRPC). A missing
+        // active row (None) means the subject is gone/deactivated — fail
+        // authentication rather than trust the claim.
+        match fetch_live_is_admin(&self.db, token_data.claims.sub).await? {
+            Some(db_is_admin) => token_data.claims.is_admin = db_is_admin,
+            None => {
+                return Err(AppError::Authentication(
+                    "Token subject is no longer an active user".to_string(),
+                ));
+            }
         }
 
         Ok(token_data.claims)
@@ -1079,8 +1224,12 @@ impl AuthService {
             return Err(AppError::Authentication("Invalid token type".to_string()));
         }
 
-        if is_token_invalidated_replica_safe(&self.db, token_data.claims.sub, token_data.claims.iat)
-            .await?
+        if is_token_invalidated_replica_safe(
+            &self.db,
+            token_data.claims.sub,
+            token_data.claims.effective_iat_ms(),
+        )
+        .await?
         {
             return Err(AppError::Authentication(
                 "Token invalidated by credential change".to_string(),
@@ -1940,6 +2089,15 @@ impl AuthService {
         // bumped `privileges_changed_at`; mirror that into the in-memory
         // invalidation map so this replica rejects pre-change JWTs on the very
         // next request without waiting for the DB-cache TTL to lapse.
+        //
+        // This is an **invalidate-then-mint** flow: `authenticate_federated`
+        // calls `generate_tokens` immediately after this, in the same request.
+        // With millisecond `iat_ms`, the freshly-minted JWT is stamped a few
+        // microseconds AFTER this invalidation, so its `iat_ms` is strictly
+        // greater than the full-millisecond watermark and survives the strict
+        // `<` check, while every pre-change token (minted earlier in real time)
+        // has `iat_ms < watermark` and is rejected (#1911 OIDC
+        // self-invalidation guard). No floored-second watermark is needed.
         if privilege_changed {
             invalidate_user_tokens(user_id);
         }
@@ -2223,6 +2381,7 @@ impl AuthService {
             email: user.email.clone(),
             is_admin: user.is_admin,
             iat: now.timestamp(),
+            iat_ms: Some(now.timestamp_millis()),
             exp: exp.timestamp(),
             token_type: "totp_pending".to_string(),
             jti: Some(Uuid::new_v4()),
@@ -2642,6 +2801,8 @@ mod tests {
             rate_limit_api_per_window: 5000,
             rate_limit_search_per_window: 300,
             rate_limit_presign_per_window: 30,
+
+            rate_limit_login_global_per_window: 8192,
             rate_limit_password_change_per_window: 5,
             rate_limit_password_change_window_secs: 900,
             rate_limit_window_secs: 60,
@@ -2723,6 +2884,7 @@ mod tests {
             email: user.email.clone(),
             is_admin: user.is_admin,
             iat: now.timestamp(),
+            iat_ms: None,
             exp: access_exp.timestamp(),
             token_type: "access".to_string(),
             jti: None,
@@ -2735,6 +2897,7 @@ mod tests {
             email: user.email.clone(),
             is_admin: user.is_admin,
             iat: now.timestamp(),
+            iat_ms: None,
             exp: refresh_exp.timestamp(),
             token_type: "refresh".to_string(),
             jti: Some(Uuid::new_v4()),
@@ -2781,6 +2944,7 @@ mod tests {
             email: "user@test.com".to_string(),
             is_admin: false,
             iat: now.timestamp(),
+            iat_ms: None,
             exp: (now + Duration::days(7)).timestamp(),
             token_type: "refresh".to_string(),
             jti: Some(Uuid::new_v4()),
@@ -2810,6 +2974,7 @@ mod tests {
             email: "expired@test.com".to_string(),
             is_admin: false,
             iat: (now - Duration::hours(2)).timestamp(),
+            iat_ms: None,
             exp: (now - Duration::hours(1)).timestamp(), // expired 1 hour ago
             token_type: "access".to_string(),
             jti: None,
@@ -2833,6 +2998,7 @@ mod tests {
             email: "u@t.com".to_string(),
             is_admin: false,
             iat: now.timestamp(),
+            iat_ms: None,
             exp: (now + Duration::hours(1)).timestamp(),
             token_type: "access".to_string(),
             jti: None,
@@ -2857,6 +3023,7 @@ mod tests {
             email: "test@x.com".to_string(),
             is_admin: true,
             iat: 1000,
+            iat_ms: None,
             exp: 2000,
             token_type: "access".to_string(),
             jti: None,
@@ -2883,6 +3050,7 @@ mod tests {
             email: "u@x.com".to_string(),
             is_admin: false,
             iat: 1000,
+            iat_ms: None,
             exp: 2000,
             token_type: "refresh".to_string(),
             jti: Some(jti),
@@ -3530,21 +3698,20 @@ mod tests {
     #[test]
     fn test_invalidate_user_tokens_marks_user() {
         let user_id = Uuid::new_v4();
-        let before = Utc::now().timestamp();
+        // Millisecond issued-at one second before the invalidation.
+        let before_ms = Utc::now().timestamp_millis() - 1000;
         invalidate_user_tokens(user_id);
-        assert!(is_token_invalidated(user_id, before - 1));
+        assert!(is_token_invalidated(user_id, before_ms));
     }
 
     #[test]
     fn test_token_issued_after_invalidation_is_accepted() {
         let user_id = Uuid::new_v4();
         invalidate_user_tokens(user_id);
-        // Watermark is `now + 1` (#1436 fix) so the sync `<=` map rejects
-        // every iat <= now+1. We bump the test "after" to `now + 2` to
-        // represent a JWT minted at least one whole second after the
-        // invalidation completed.
-        let after = Utc::now().timestamp() + 2;
-        assert!(!is_token_invalidated(user_id, after));
+        // Watermark is `now` (full ms). A token minted one full second later
+        // (in ms) is strictly after the watermark, so it is accepted.
+        let after_ms = Utc::now().timestamp_millis() + 1000;
+        assert!(!is_token_invalidated(user_id, after_ms));
     }
 
     #[test]
@@ -3557,56 +3724,58 @@ mod tests {
     fn test_reinvalidation_updates_timestamp() {
         let user_id = Uuid::new_v4();
         invalidate_user_tokens(user_id);
-        let mid = Utc::now().timestamp();
+        let mid_ms = Utc::now().timestamp_millis();
         // Slight delay so second invalidation gets a newer timestamp
         std::thread::sleep(std::time::Duration::from_millis(10));
         invalidate_user_tokens(user_id);
-        // Same `+2` rationale as test_token_issued_after_invalidation_is_accepted.
-        let after = Utc::now().timestamp() + 2;
+        // Watermark is `now` (full ms). Use `+1000` to represent a token minted
+        // a full second after the invalidation.
+        let after_ms = Utc::now().timestamp_millis() + 1000;
         // Token issued before second invalidation is still rejected
-        assert!(is_token_invalidated(user_id, mid - 1));
+        assert!(is_token_invalidated(user_id, mid_ms - 1));
         // Token issued after second invalidation is accepted
-        assert!(!is_token_invalidated(user_id, after));
+        assert!(!is_token_invalidated(user_id, after_ms));
     }
 
     #[test]
     fn test_token_issued_at_exact_invalidation_time_is_rejected() {
-        // Boundary fix (#1173): `iat == changed_at` (1-second JWT resolution)
-        // must be rejected. Previously this was `<` and silently let through
-        // tokens minted in the same wall-clock second as the invalidation.
+        // Boundary fix (#1173): a token whose millisecond issued-at equals the
+        // watermark must be rejected on the sync plane (`<=`). Both sides are
+        // milliseconds now (the token via `Claims::effective_iat_ms`).
         let user_id = Uuid::new_v4();
-        let pre = Utc::now().timestamp();
         invalidate_user_tokens(user_id);
-        // A token issued in the same second as the invalidation (iat == watermark)
-        // should now be rejected.
         let map = invalidation_map().read().unwrap();
-        let &(watermark, _) = map.get(&user_id).unwrap();
+        let &(watermark_ms, _) = map.get(&user_id).unwrap();
         drop(map);
+        // A token issued at the exact watermark millisecond (`iat_ms ==
+        // watermark_ms`) is rejected by `<=`.
         assert!(
-            is_token_invalidated(user_id, watermark),
-            "same-second token must be rejected"
+            is_token_invalidated(user_id, watermark_ms),
+            "token at exact watermark ms must be rejected"
         );
-        // Token issued strictly before invalidation is still rejected.
-        assert!(is_token_invalidated(user_id, pre - 1));
-        // Token issued strictly after invalidation is still accepted.
-        assert!(!is_token_invalidated(user_id, watermark + 1));
+        // A token issued one millisecond earlier is rejected.
+        assert!(is_token_invalidated(user_id, watermark_ms - 1));
+        // A token issued one millisecond later is accepted (the same-second
+        // re-login case that #1933 wrongly rejected).
+        assert!(!is_token_invalidated(user_id, watermark_ms + 1));
     }
 
     #[test]
     fn test_multiple_users_invalidated_independently() {
         let user_a = Uuid::new_v4();
         let user_b = Uuid::new_v4();
-        let before = Utc::now().timestamp() - 1;
+        // Millisecond issued-at one second before either invalidation.
+        let before_ms = Utc::now().timestamp_millis() - 1000;
 
         invalidate_user_tokens(user_a);
         // user_a is invalidated, user_b is not
-        assert!(is_token_invalidated(user_a, before));
-        assert!(!is_token_invalidated(user_b, before));
+        assert!(is_token_invalidated(user_a, before_ms));
+        assert!(!is_token_invalidated(user_b, before_ms));
 
         invalidate_user_tokens(user_b);
         // now both are invalidated for tokens issued before
-        assert!(is_token_invalidated(user_a, before));
-        assert!(is_token_invalidated(user_b, before));
+        assert!(is_token_invalidated(user_a, before_ms));
+        assert!(is_token_invalidated(user_b, before_ms));
     }
 
     #[test]
@@ -3614,7 +3783,7 @@ mod tests {
         // Calling is_token_invalidated on a never-seen user should not panic
         // and should return false, exercising the OnceLock init path
         let fresh = Uuid::new_v4();
-        assert!(!is_token_invalidated(fresh, Utc::now().timestamp()));
+        assert!(!is_token_invalidated(fresh, Utc::now().timestamp_millis()));
     }
 
     // -----------------------------------------------------------------------
@@ -3644,16 +3813,71 @@ mod tests {
         (AuthService::new(pool, cfg.clone()), cfg)
     }
 
+    /// DB-backed variant of [`invalidation_test_service`] for tests that drive
+    /// `validate_access_token_async` end-to-end. Since the async validator now
+    /// re-stamps `is_admin` from the live `users` row (the admin-authz fix), the
+    /// subject must be a real active DB row; an invalid/lazy pool would fail the
+    /// `fetch_live_is_admin` read. Inserts an active NON-admin user with the
+    /// given `user_id` (matching `make_test_user`'s default `is_admin = false`)
+    /// and backdated watermarks so the credential-change check starts permissive
+    /// and the *invalidation ordering* under test is the only discriminator.
+    ///
+    /// Returns `None` when `DATABASE_URL` is unset so these tests skip silently
+    /// on offline `cargo test --lib`, matching the other DB-backed tests here.
+    async fn invalidation_test_service_with_db(
+        user_id: Uuid,
+    ) -> Option<(AuthService, Arc<Config>, sqlx::PgPool)> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        let pool = sqlx::PgPool::connect(&url).await.ok()?;
+        let username = format!("invtest_{}", &Uuid::new_v4().to_string()[..8]);
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, \
+             is_admin, is_active, failed_login_attempts, password_changed_at, \
+             created_at, updated_at) \
+             VALUES ($1, $2, $3, 'unused', 'local', false, true, 0, \
+             NOW() - INTERVAL '120 seconds', NOW() - INTERVAL '120 seconds', \
+             NOW() - INTERVAL '120 seconds')",
+        )
+        .bind(user_id)
+        .bind(&username)
+        .bind(format!("{username}@test.local"))
+        .execute(&pool)
+        .await
+        .expect("insert invalidation test user");
+        let cfg = make_test_config();
+        Some((AuthService::new(pool.clone(), cfg.clone()), cfg, pool))
+    }
+
+    /// Drop a row inserted by [`invalidation_test_service_with_db`].
+    async fn cleanup_invtest_user(pool: &sqlx::PgPool, user_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    }
+
     /// Mint an access JWT for `user` with an explicit `iat` (seconds), signed
     /// with the service's configured secret — exactly the shape the HTTP
     /// middleware decodes.
     fn mint_access_token_at(cfg: &Config, user: &User, iat: i64) -> String {
+        // Models a token whose `iat_ms` lands on the floored second boundary
+        // (`iat * 1000`) — i.e. the conservative value a legacy token's
+        // `effective_iat_ms` falls back to. Tests that need a specific
+        // sub-second `iat_ms` use `mint_access_token_at_ms`.
+        mint_access_token_at_ms(cfg, user, iat, iat.saturating_mul(1000))
+    }
+
+    /// Mint an access JWT with an explicit whole-second `iat` AND an explicit
+    /// millisecond `iat_ms`, so tests can pin same-second sub-second ordering
+    /// deterministically without relying on wall-clock crossing a second.
+    fn mint_access_token_at_ms(cfg: &Config, user: &User, iat: i64, iat_ms: i64) -> String {
         let claims = Claims {
             sub: user.id,
             username: user.username.clone(),
             email: user.email.clone(),
             is_admin: user.is_admin,
             iat,
+            iat_ms: Some(iat_ms),
             exp: iat + 3600,
             token_type: "access".to_string(),
             jti: None,
@@ -3711,13 +3935,336 @@ mod tests {
         invalidate_user_tokens(user.id);
 
         // A token minted at least one whole second after the invalidation.
-        // The watermark is `now + 1` (#1436), so `now + 2` is strictly newer.
-        let post_change_iat = Utc::now().timestamp() + 2;
+        // The watermark is `now`, so `now + 1` is strictly newer.
+        let post_change_iat = Utc::now().timestamp() + 1;
         let post_change_token = mint_access_token_at(&cfg, &user, post_change_iat);
 
         assert!(
             service.validate_access_token(&post_change_token).is_ok(),
             "a token minted after the credential change MUST be accepted"
+        );
+    }
+
+    /// Regression test for #1911: OIDC login self-invalidation race condition.
+    ///
+    /// The `authenticate_federated` flow calls `apply_role_mapping` (which now
+    /// calls plain `invalidate_user_tokens`, full ms) immediately before
+    /// `generate_tokens`. This is the invalidate-then-mint case: the freshly-
+    /// minted JWT carries an `iat_ms` a few microseconds AFTER the invalidate,
+    /// so `iat_ms > watermark` and `is_token_invalidated_replica_safe`'s strict
+    /// `<` accepts it, while a pre-change token (`iat_ms < watermark`) is
+    /// rejected. Numbers are pinned — no reliance on a wall-clock boundary.
+    ///
+    /// Uses the lazy (never-connected) pool — the in-memory cache populated
+    /// by the invalidation serves the watermark without a DB round-trip.
+    #[tokio::test]
+    async fn test_oidc_login_token_not_self_invalidated() {
+        let user = make_test_user();
+        // DB-backed: the async validator re-stamps is_admin from the live row,
+        // so the subject must exist. Skips silently without DATABASE_URL.
+        let Some((service, cfg, pool)) = invalidation_test_service_with_db(user.id).await else {
+            return;
+        };
+
+        // Anchor on the current second so the JWT `exp` is in the future and
+        // the watermark is within the in-memory retention window; the
+        // discriminator is the PINNED sub-second offset, not a clock boundary.
+        let iat_sec = Utc::now().timestamp();
+        let watermark_ms = iat_sec.saturating_mul(1000) + 141;
+
+        // Step 1: simulate apply_role_mapping → invalidate_user_tokens (full ms).
+        invalidate_user_tokens_at(user.id, watermark_ms);
+
+        // Step 2: simulate generate_tokens immediately after — minted 1 ms later
+        // in the SAME wall-clock second.
+        let token = mint_access_token_at_ms(&cfg, &user, iat_sec, watermark_ms + 1);
+
+        // The replica-safe async path (HTTP auth middleware) must accept this token.
+        let result = service.validate_access_token_async(&token).await;
+        assert!(
+            result.is_ok(),
+            "OIDC login token must not self-invalidate: {:?}",
+            result.err(),
+        );
+
+        // A pre-change token (1 ms before the watermark, same second) must be
+        // rejected.
+        let old_token = mint_access_token_at_ms(&cfg, &user, iat_sec, watermark_ms - 1);
+        let old_result = service.validate_access_token_async(&old_token).await;
+        assert!(
+            old_result.is_err(),
+            "pre-invalidation token must be rejected"
+        );
+
+        cleanup_invtest_user(&pool, user.id).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Sub-second (millisecond) `iat_ms` precision. With both the token's
+    // issued-at and the credential-change watermark in milliseconds, a token
+    // minted in the same wall-clock second as a change is ordered correctly:
+    // pre-change rejected, post-change (even same second) accepted.
+    // -----------------------------------------------------------------------
+
+    /// The auth-gate case: a password change (full-precision
+    /// `invalidate_user_tokens`) must reject a token minted in the SAME
+    /// wall-clock second strictly before it, on both the sync and the
+    /// replica-safe async plane. Numbers pinned.
+    #[tokio::test]
+    async fn test_password_change_rejects_same_second_pre_change_token() {
+        let (service, cfg) = invalidation_test_service();
+        let user = make_test_user();
+
+        // Anchor on the current second (future `exp`, retained watermark);
+        // PINNED sub-second offsets do the discriminating. Watermark at T.141;
+        // the pre-change token was minted at T.000 — same second, earlier in ms.
+        let iat_sec = Utc::now().timestamp();
+        let watermark_ms = iat_sec.saturating_mul(1000) + 141;
+        let token = mint_access_token_at_ms(&cfg, &user, iat_sec, iat_sec.saturating_mul(1000));
+
+        invalidate_user_tokens_at(user.id, watermark_ms);
+
+        // Sync plane (`<=`): same-second pre-change token rejected.
+        assert!(
+            service.validate_access_token(&token).is_err(),
+            "sync plane must reject the same-second pre-change token"
+        );
+        // Replica-safe async plane (strict `<`, served from the in-memory
+        // cache so no DB round-trip): same-second pre-change token rejected.
+        assert!(
+            service.validate_access_token_async(&token).await.is_err(),
+            "async plane must reject the same-second pre-change token"
+        );
+    }
+
+    /// The platform-gate case (the #1933 regression): an invalidate-then-relogin
+    /// in the SAME wall-clock second must ACCEPT the new token while rejecting an
+    /// older same-second token. This is the test that would have caught #1933.
+    #[tokio::test]
+    async fn test_same_second_relogin_after_invalidation_accepted() {
+        let user = make_test_user();
+        let Some((service, cfg, pool)) = invalidation_test_service_with_db(user.id).await else {
+            return;
+        };
+
+        // Anchor on the current second; PINNED sub-second offsets discriminate.
+        let iat_sec = Utc::now().timestamp();
+        let watermark_ms = iat_sec.saturating_mul(1000) + 141;
+        invalidate_user_tokens_at(user.id, watermark_ms);
+
+        // NEW token minted 5 ms after the change, SAME second → accepted on
+        // both planes.
+        let new_token = mint_access_token_at_ms(&cfg, &user, iat_sec, watermark_ms + 5);
+        assert!(
+            service.validate_access_token(&new_token).is_ok(),
+            "sync plane must accept the same-second post-change re-login"
+        );
+        assert!(
+            service
+                .validate_access_token_async(&new_token)
+                .await
+                .is_ok(),
+            "async plane must accept the same-second post-change re-login (the #1933 regression)"
+        );
+
+        // OLD token minted 5 ms before the change, SAME second → rejected.
+        let old_token = mint_access_token_at_ms(&cfg, &user, iat_sec, watermark_ms - 5);
+        assert!(
+            service.validate_access_token(&old_token).is_err(),
+            "sync plane must still reject the same-second pre-change token"
+        );
+        assert!(
+            service
+                .validate_access_token_async(&old_token)
+                .await
+                .is_err(),
+            "async plane must still reject the same-second pre-change token"
+        );
+
+        cleanup_invtest_user(&pool, user.id).await;
+    }
+
+    /// 10 rapid same-second re-logins (mirrors
+    /// `test-admin-password-recovery.sh`'s `10/10` requirement): each iteration
+    /// raises the watermark by 1 ms and mints a token 1 ms later; all 10 must
+    /// validate. The seconds-granularity comparator gave `0/10` here under #1933.
+    #[tokio::test]
+    async fn test_ten_rapid_same_second_relogins_all_accepted() {
+        let user = make_test_user();
+        let Some((service, cfg, pool)) = invalidation_test_service_with_db(user.id).await else {
+            return;
+        };
+
+        // Anchor on the current second; PINNED 1-ms steps discriminate.
+        let iat_sec = Utc::now().timestamp();
+        let base_ms = iat_sec.saturating_mul(1000) + 100;
+        for i in 0..10 {
+            let watermark_ms = base_ms + i;
+            invalidate_user_tokens_at(user.id, watermark_ms);
+            let token = mint_access_token_at_ms(&cfg, &user, iat_sec, watermark_ms + 1);
+            assert!(
+                service.validate_access_token(&token).is_ok(),
+                "sync plane: same-second re-login #{i} must be accepted"
+            );
+            assert!(
+                service.validate_access_token_async(&token).await.is_ok(),
+                "async plane: same-second re-login #{i} must be accepted"
+            );
+        }
+
+        cleanup_invtest_user(&pool, user.id).await;
+    }
+
+    /// Fresh-user same-second first login (#1173/rbac/mesh): the DB-read
+    /// watermark is now full ms (creation `password_changed_at` e.g. ...787141).
+    /// A real first login mints strictly later in wall-clock time, so its
+    /// `iat_ms` exceeds the creation watermark even at full precision and is
+    /// ACCEPTED — no floor needed. A subsequent real password change still
+    /// REJECTS a same-second pre-change token. Numbers pinned.
+    #[tokio::test]
+    async fn test_fresh_user_same_second_first_login_accepted() {
+        let user = make_test_user();
+        let Some((service, cfg, pool)) = invalidation_test_service_with_db(user.id).await else {
+            return;
+        };
+
+        // DB-derived creation watermark at full ms (sub-second creation
+        // offset), anchored on the current second so the JWT `exp` is future
+        // and the watermark stays within the retention window.
+        let iat_sec = Utc::now().timestamp();
+        let creation_ms = iat_sec.saturating_mul(1000) + 787;
+        invalidate_user_tokens_at(user.id, creation_ms);
+
+        // First login mints 50 ms later (strictly after creation) — SAME second.
+        let fresh_login = mint_access_token_at_ms(&cfg, &user, iat_sec, creation_ms + 50);
+        assert!(
+            service
+                .validate_access_token_async(&fresh_login)
+                .await
+                .is_ok(),
+            "fresh-user same-second first login must be accepted (full-ms ordering)"
+        );
+
+        // A real password change at creation_ms + 200; a pre-change token at
+        // creation_ms + 100 (minted before the change) must be rejected.
+        invalidate_user_tokens_at(user.id, creation_ms + 200);
+        let pre_change = mint_access_token_at_ms(&cfg, &user, iat_sec, creation_ms + 100);
+        assert!(
+            service
+                .validate_access_token_async(&pre_change)
+                .await
+                .is_err(),
+            "a same-second pre-change token must be rejected after a real password change"
+        );
+
+        cleanup_invtest_user(&pool, user.id).await;
+    }
+
+    /// Legacy token (no `iat_ms`) backward-compat: `effective_iat_ms` falls back
+    /// to the floored `iat * 1000`, the conservative side. Against a same-second
+    /// full-ms watermark such a token is REJECTED on both planes.
+    #[tokio::test]
+    async fn test_legacy_token_without_iat_ms_falls_back_to_floored_seconds() {
+        let (service, cfg) = invalidation_test_service();
+        let user = make_test_user();
+
+        let iat_sec = Utc::now().timestamp();
+        let legacy = Claims {
+            sub: user.id,
+            username: user.username.clone(),
+            email: user.email.clone(),
+            is_admin: user.is_admin,
+            iat: iat_sec,
+            iat_ms: None,
+            exp: iat_sec + 3600,
+            token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
+        };
+        // The fallback is exactly `iat * 1000`.
+        assert_eq!(legacy.effective_iat_ms(), iat_sec.saturating_mul(1000));
+
+        let token = encode(
+            &Header::default(),
+            &legacy,
+            &EncodingKey::from_secret(cfg.jwt_secret.as_bytes()),
+        )
+        .expect("encode legacy token");
+
+        // Same-second full-ms watermark (T.000 + 1 ms). The legacy token's
+        // effective_iat_ms == T.000 < watermark → rejected on both planes.
+        let watermark_ms = iat_sec.saturating_mul(1000) + 1;
+        invalidate_user_tokens_at(user.id, watermark_ms);
+        assert!(
+            service.validate_access_token(&token).is_err(),
+            "sync plane must reject a legacy same-second pre-change token (floored fallback)"
+        );
+        assert!(
+            service.validate_access_token_async(&token).await.is_err(),
+            "async plane must reject a legacy same-second pre-change token (floored fallback)"
+        );
+    }
+
+    /// The exempt-caller variant operates in milliseconds: the calling token
+    /// (`caller_iat_ms`) is exempt, while EVERY strictly-older token — including
+    /// one from the SAME second (`caller_iat_ms - 1`) — is invalidated. This is
+    /// the precision the seconds-granularity version lacked.
+    #[test]
+    fn test_except_caller_ms() {
+        let user_id = Uuid::new_v4();
+        // Anchor on the current second (so the watermark stays within the
+        // in-memory retention window) with a PINNED sub-second part (537 ms) so
+        // the same-second-older case is exercised deterministically.
+        let caller_iat_ms = Utc::now().timestamp().saturating_mul(1000) + 537;
+
+        invalidate_user_tokens_except_caller(user_id, caller_iat_ms);
+
+        // The watermark is `caller_iat_ms - 1`: the calling token
+        // (`caller_iat_ms <= caller_iat_ms - 1` is false) survives.
+        assert!(
+            !is_token_invalidated(user_id, caller_iat_ms),
+            "the calling token must be exempt"
+        );
+        // An older token from the SAME second (one ms earlier) is invalidated.
+        assert!(
+            is_token_invalidated(user_id, caller_iat_ms - 1),
+            "an older same-second token must be invalidated (ms precision)"
+        );
+        // A token from several seconds earlier is invalidated.
+        assert!(
+            is_token_invalidated(user_id, caller_iat_ms - 5000),
+            "a strictly older token must be invalidated"
+        );
+    }
+
+    /// The in-memory watermark write is monotonic: a later, lower watermark
+    /// (e.g. a stale DB fetch arriving after a fresh password-change
+    /// invalidation) must NOT lower the recorded watermark.
+    #[test]
+    fn test_watermark_monotonic_no_stale_lowering() {
+        let user_id = Uuid::new_v4();
+        let high_ms = Utc::now().timestamp_millis();
+        let low_ms = high_ms - 60_000; // one minute earlier (a stale fetch)
+
+        // Record the high watermark (the real password change), then attempt
+        // to lower it with a stale value.
+        invalidate_user_tokens_at(user_id, high_ms);
+        invalidate_user_tokens_at(user_id, low_ms);
+
+        let stored = {
+            let map = invalidation_map().read().unwrap();
+            map.get(&user_id).map(|&(ms, _)| ms).unwrap()
+        };
+        assert_eq!(
+            stored, high_ms,
+            "a later, lower watermark must not lower the stored watermark"
+        );
+
+        // A token at the low watermark (in ms) is still rejected (the high
+        // watermark dominates).
+        assert!(
+            is_token_invalidated(user_id, low_ms),
+            "the high watermark must keep rejecting pre-change tokens"
         );
     }
 
@@ -3996,6 +4543,7 @@ mod tests {
             email: "evil@test.com".to_string(),
             is_admin: true,
             iat: Utc::now().timestamp(),
+            iat_ms: None,
             exp: (Utc::now() + Duration::hours(1)).timestamp(),
             token_type: "access".to_string(),
             jti: None,
@@ -4275,20 +4823,21 @@ mod tests {
         // drift between this process and the database server. Same-second
         // (iat == watermark) is intentionally accepted post-#1248, so a test
         // pinning the "issued before" semantic must leave an unambiguous gap.
-        let iat_before = (Utc::now() - Duration::seconds(120)).timestamp();
+        let iat_before = (Utc::now() - Duration::seconds(120)).timestamp_millis();
 
         // Token issued before the user's existing password_changed_at watermark
         // (inserted as NOW - 60s by `insert_test_user`) must be flagged
         // invalidated by the DB-backed check. This exercises the cross-replica
         // path because the in-memory fast-path map is empty for this user_id
-        // on this process.
+        // on this process. Issued-at is in milliseconds (matching
+        // `Claims::effective_iat_ms`).
         let rejected = is_token_invalidated_replica_safe(&pool, user_id, iat_before)
             .await
             .expect("DB check must succeed");
         assert!(rejected, "token issued before watermark must be rejected");
 
         // A token issued well after the watermark should be accepted.
-        let iat_after = (Utc::now() + Duration::seconds(60)).timestamp();
+        let iat_after = (Utc::now() + Duration::seconds(60)).timestamp_millis();
         let rejected = is_token_invalidated_replica_safe(&pool, user_id, iat_after)
             .await
             .expect("DB check must succeed");
@@ -4489,17 +5038,19 @@ mod tests {
         .await
         .expect("insert fresh user");
 
-        // Token iat == the same second the user was inserted. In production
-        // this is what happens when `POST /users` is followed immediately
-        // by `POST /auth/login` (both wall-clock second N).
-        let iat_same_second = Utc::now().timestamp();
-        let rejected = is_token_invalidated_replica_safe(&pool, id, iat_same_second)
+        // Token iat_ms captured AFTER the INSERT, in the same wall-clock second
+        // as user creation. In production this is `POST /users` followed
+        // immediately by `POST /auth/login`. With full-ms watermarks the login
+        // is strictly later than `password_changed_at DEFAULT NOW()`, so its
+        // `iat_ms` exceeds the creation watermark and is accepted.
+        let iat_same_second_ms = Utc::now().timestamp_millis();
+        let rejected = is_token_invalidated_replica_safe(&pool, id, iat_same_second_ms)
             .await
             .expect("DB check must succeed");
         assert!(
             !rejected,
-            "token issued in the same wall-clock second as user creation \
-             must be accepted (otherwise admin_middleware returns 401 \
+            "token issued in the same wall-clock second as (but after) user \
+             creation must be accepted (otherwise admin_middleware returns 401 \
              instead of letting the request reach the is_admin check)"
         );
 
@@ -4552,7 +5103,7 @@ mod tests {
 
         // Token minted while still admin (iat = NOW - 60s, after the backdated
         // creation watermark). Must be ACCEPTED before any demotion.
-        let pre_demotion_iat = (Utc::now() - Duration::seconds(60)).timestamp();
+        let pre_demotion_iat = (Utc::now() - Duration::seconds(60)).timestamp_millis();
         let rejected_before = is_token_invalidated_replica_safe(&pool, user_id, pre_demotion_iat)
             .await
             .expect("DB check must succeed");
@@ -4586,7 +5137,7 @@ mod tests {
 
         // A token minted AFTER the demotion (with the new is_admin=false claim)
         // is still accepted — invalidation is watermark-scoped, not a lockout.
-        let post_demotion_iat = (Utc::now() + Duration::seconds(60)).timestamp();
+        let post_demotion_iat = (Utc::now() + Duration::seconds(60)).timestamp_millis();
         if let Ok(mut map) = invalidation_map().write() {
             map.remove(&user_id);
         }
@@ -4622,6 +5173,216 @@ mod tests {
             .await
             .expect("query succeeds even for missing user");
         assert!(!result);
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin authorization is derived from the live server-side role, not the
+    // JWT `is_admin` claim. `validate_access_token_async` re-stamps `is_admin`
+    // from `users.is_admin` so a validly-signed token forged for a real
+    // low-priv subject with `is_admin:true` is NOT granted admin. DB-backed;
+    // skips silently without DATABASE_URL.
+    // -----------------------------------------------------------------------
+
+    /// Mint an access JWT for an explicit subject id with an explicit `is_admin`
+    /// claim, signed with the service secret. Used to model a forged-admin token
+    /// for a real low-priv subject. `iat` is recent so the credential-change
+    /// watermark accepts it (the test isolates the is_admin re-stamp, not the
+    /// watermark).
+    fn mint_access_token_for_sub(cfg: &Config, sub: Uuid, claim_is_admin: bool) -> String {
+        let now = Utc::now();
+        let claims = Claims {
+            sub,
+            username: "forged".to_string(),
+            email: "forged@test.local".to_string(),
+            is_admin: claim_is_admin,
+            iat: now.timestamp(),
+            iat_ms: Some(now.timestamp_millis()),
+            exp: now.timestamp() + 3600,
+            token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
+        };
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(cfg.jwt_secret.as_bytes()),
+        )
+        .expect("encode access token")
+    }
+
+    #[tokio::test]
+    async fn test_validate_async_restamps_forged_admin_to_db_false() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let cfg = make_test_config();
+        let svc = AuthService::new(pool.clone(), cfg.clone());
+
+        // A real, active, NON-admin DB user.
+        let username = format!("restamp_low_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+        if let Ok(mut map) = invalidation_map().write() {
+            map.remove(&user_id);
+        }
+
+        // A validly-signed token forged for that subject claiming is_admin=true.
+        let forged = mint_access_token_for_sub(&cfg, user_id, true);
+        let claims = svc
+            .validate_access_token_async(&forged)
+            .await
+            .expect("validation succeeds (token is well-formed and active)");
+
+        // EXPLOIT GUARD: the returned claim must reflect the DB role (false),
+        // NOT the forged claim (true).
+        assert!(
+            !claims.is_admin,
+            "validate_access_token_async must re-stamp is_admin from the DB; a \
+             forged is_admin=true token for a non-admin user must yield false"
+        );
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_validate_async_keeps_real_admin_true() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let cfg = make_test_config();
+        let svc = AuthService::new(pool.clone(), cfg.clone());
+
+        // A real, active ADMIN DB user.
+        let username = format!("restamp_admin_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, \
+             is_admin, is_active, failed_login_attempts, password_changed_at, \
+             created_at, updated_at) \
+             VALUES ($1, $2, $3, 'unused', 'local', true, true, 0, \
+             NOW() - INTERVAL '60 seconds', NOW() - INTERVAL '60 seconds', \
+             NOW() - INTERVAL '60 seconds')",
+        )
+        .bind(user_id)
+        .bind(&username)
+        .bind(format!("{username}@test.local"))
+        .execute(&pool)
+        .await
+        .expect("insert admin user");
+        if let Ok(mut map) = invalidation_map().write() {
+            map.remove(&user_id);
+        }
+
+        // Even a token whose claim said is_admin=false is re-stamped to the DB
+        // truth (true) — the DB is authoritative in both directions.
+        let token = mint_access_token_for_sub(&cfg, user_id, false);
+        let claims = svc
+            .validate_access_token_async(&token)
+            .await
+            .expect("validation succeeds for an active admin");
+        assert!(
+            claims.is_admin,
+            "a real DB admin must be re-stamped is_admin=true"
+        );
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_validate_async_rejects_inactive_subject() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let cfg = make_test_config();
+        let svc = AuthService::new(pool.clone(), cfg.clone());
+
+        // An inactive user. fetch_live_is_admin returns None (no active row),
+        // so validation must FAIL — never silently grant (or even authenticate).
+        let username = format!("restamp_inactive_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, \
+             is_admin, is_active, failed_login_attempts, password_changed_at, \
+             created_at, updated_at) \
+             VALUES ($1, $2, $3, 'unused', 'local', true, false, 0, \
+             NOW() - INTERVAL '60 seconds', NOW() - INTERVAL '60 seconds', \
+             NOW() - INTERVAL '60 seconds')",
+        )
+        .bind(user_id)
+        .bind(&username)
+        .bind(format!("{username}@test.local"))
+        .execute(&pool)
+        .await
+        .expect("insert inactive user");
+        if let Ok(mut map) = invalidation_map().write() {
+            map.remove(&user_id);
+        }
+
+        let token = mint_access_token_for_sub(&cfg, user_id, true);
+        let result = svc.validate_access_token_async(&token).await;
+        assert!(
+            matches!(result, Err(AppError::Authentication(_))),
+            "an inactive/deleted subject must fail authentication, never silently \
+             return admin; got {result:?}"
+        );
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_live_is_admin_reads_db_role() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        // Non-admin active user => Some(false).
+        let username = format!("fla_low_{}", &Uuid::new_v4().to_string()[..8]);
+        let low_id = insert_test_user(&pool, &username).await;
+        assert_eq!(
+            fetch_live_is_admin(&pool, low_id).await.expect("query ok"),
+            Some(false)
+        );
+
+        // Unknown subject => None.
+        assert_eq!(
+            fetch_live_is_admin(&pool, Uuid::new_v4())
+                .await
+                .expect("query ok"),
+            None
+        );
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(low_id)
+            .execute(&pool)
+            .await;
     }
 
     // -----------------------------------------------------------------------
@@ -5198,6 +5959,45 @@ mod tests {
             found_in.contains(&"src/api/middleware/auth.rs"),
             "middleware/auth.rs must call the replica-safe validator; \
              found references only in: {found_in:?}",
+        );
+    }
+
+    /// Meta-test: assert that `validate_access_token_async` re-stamps `is_admin`
+    /// from the live DB role. Admin authorization MUST derive from
+    /// `users.is_admin`, not the client-supplied JWT claim. A future refactor
+    /// that drops the `fetch_live_is_admin` re-stamp would silently reopen the
+    /// "forged is_admin=true for a real low-priv subject grants admin" gap.
+    ///
+    /// Implemented as a source-text search (mirroring
+    /// `test_validate_access_token_async_has_production_caller`) because the
+    /// re-stamp is an in-function assignment the type system gives no free way
+    /// to observe.
+    #[test]
+    fn test_validate_async_restamps_is_admin_from_db() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let path = std::path::Path::new(manifest_dir).join("src/services/auth_service.rs");
+        let src = std::fs::read_to_string(&path).expect("read auth_service.rs");
+
+        // The validator must call the live-role helper.
+        assert!(
+            src.contains("fetch_live_is_admin"),
+            "validate_access_token_async MUST consult fetch_live_is_admin so \
+             admin authorization derives from the DB role, not the JWT claim."
+        );
+        // And it must assign the result back onto the claims (the re-stamp).
+        assert!(
+            src.contains("token_data.claims.is_admin = "),
+            "validate_access_token_async MUST overwrite token_data.claims.is_admin \
+             with the live DB role; do not return the client-supplied claim."
+        );
+
+        // The gRPC interceptor must do the same when a DB pool is wired.
+        let grpc_path = std::path::Path::new(manifest_dir).join("src/grpc/auth_interceptor.rs");
+        let grpc = std::fs::read_to_string(&grpc_path).expect("read auth_interceptor.rs");
+        assert!(
+            grpc.contains("fetch_live_is_admin"),
+            "the gRPC interceptor MUST re-stamp is_admin from the DB role before \
+             the require_admin gate when a DB pool is present."
         );
     }
 }

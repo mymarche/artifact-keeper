@@ -22,8 +22,8 @@ use super::middleware::auth::{
 use super::middleware::demo::demo_guard;
 use super::middleware::guest_access::{guest_access_guard, GuestAccessState};
 use super::middleware::rate_limit::{
-    rate_limit_by_ip_middleware, rate_limit_middleware, RateLimitExemptions, RateLimitState,
-    RateLimiter,
+    login_rate_limit_middleware, rate_limit_by_ip_middleware, rate_limit_middleware,
+    LoginRateLimitState, RateLimitExemptions, RateLimitState, RateLimiter,
 };
 use super::middleware::setup::setup_guard;
 use super::middleware::tracing::correlation_id_middleware;
@@ -301,6 +301,16 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         state.config.rate_limit_presign_per_window,
         state.config.rate_limit_window_secs,
     ));
+    // Global shedding backstop for the login path. The login limiter keys
+    // per-(username, IP); this single-bucket backstop bounds the total login
+    // volume per window (and therefore the size of the per-key map) so a
+    // username-cycling attacker cannot exhaust memory via unbounded distinct
+    // keys. Sized far above any legitimate concurrent-login volume so real
+    // users never reach it; it sheds rather than starves.
+    let login_global_rate_limiter = Arc::new(RateLimiter::new(
+        state.config.rate_limit_login_global_per_window,
+        state.config.rate_limit_window_secs,
+    ));
     // Stricter per-user bucket for self-password-change attempts. The
     // handler bcrypt-verifies the current password, so an attacker who
     // already holds the victim's JWT can otherwise drive ~`api/min`
@@ -324,6 +334,17 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         limiter: Arc::clone(&auth_rate_limiter),
         exemptions: Arc::clone(&exemptions),
         enabled: rate_limit_enabled,
+    };
+    // Login-only state: keys the shared auth limiter per-(username, IP) and
+    // gates it behind the global shedding backstop. Applied only to /login so
+    // /logout and /refresh keep the plain IP-keyed limiter.
+    let login_rate_limit_state = LoginRateLimitState {
+        inner: RateLimitState {
+            limiter: Arc::clone(&auth_rate_limiter),
+            exemptions: Arc::clone(&exemptions),
+            enabled: rate_limit_enabled,
+        },
+        backstop: Arc::clone(&login_global_rate_limiter),
     };
     // Separate state for the unauthenticated TOTP second-factor endpoint
     // (`/auth/totp/verify`). Shares the `auth_rate_limiter` window so the
@@ -361,6 +382,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         let api_cleanup = Arc::clone(&api_rate_limiter);
         let search_cleanup = Arc::clone(&search_rate_limiter);
         let presign_cleanup = Arc::clone(&presign_rate_limiter);
+        let login_global_cleanup = Arc::clone(&login_global_rate_limiter);
         let password_change_cleanup = Arc::clone(&password_change_rate_limiter);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -370,20 +392,41 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 api_cleanup.cleanup_expired().await;
                 search_cleanup.cleanup_expired().await;
                 presign_cleanup.cleanup_expired().await;
+                login_global_cleanup.cleanup_expired().await;
                 password_change_cleanup.cleanup_expired().await;
             }
         });
     }
 
     Router::new()
-        // Public system configuration (no auth required)
-        .route(
-            "/system/config",
-            get(handlers::system_config::get_system_config),
+        // System configuration. The endpoint is reachable without auth so
+        // frontends can discover login/upload affordances pre-authentication,
+        // but it runs through `optional_auth_middleware` so the handler can
+        // tell whether the caller is an admin. Security-posture fields
+        // (scanner/auth-provider/permission/plugin-signing/storage state) are
+        // redacted for anonymous and non-admin callers and only returned to
+        // admins — anonymous callers should not be able to fingerprint the
+        // instance's defensive configuration.
+        .nest(
+            "/system",
+            handlers::system_config::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                optional_auth_middleware,
+            )),
         )
         // Setup status (public, no auth)
         .nest("/setup", handlers::auth::setup_router())
-        // Auth routes - split into public and protected (rate limited)
+        // Auth routes - split into login / public / protected (rate limited).
+        // /login carries the per-(username, IP) login limiter so a junk flood
+        // against one identity/origin cannot lock out other accounts; /logout
+        // and /refresh (no `username` field) keep the plain IP-keyed limiter.
+        .nest(
+            "/auth",
+            handlers::auth::login_router().layer(middleware::from_fn_with_state(
+                login_rate_limit_state,
+                login_rate_limit_middleware,
+            )),
+        )
         .nest(
             "/auth",
             handlers::auth::public_router().layer(middleware::from_fn_with_state(
@@ -568,17 +611,32 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 optional_auth_middleware,
             )),
         )
-        // Search routes with optional auth and dedicated rate limiting (300 req/min)
+        // Search routes with optional auth and dedicated rate limiting (300 req/min).
+        //
+        // Layer ORDER matters: Tower applies the LAST `.layer()` as the
+        // OUTERMOST wrapper (it runs first on the request path). The rate-limit
+        // middleware keys authenticated callers by `user:<id>` and falls back to
+        // `ip:<addr>` only when no `AuthExtension` is present. For that per-user
+        // keying to work, `optional_auth_middleware` must run BEFORE the limiter
+        // so the auth extension is populated when the limiter reads it.
+        //
+        // Therefore the limiter is applied FIRST here (making it the inner layer)
+        // and the auth middleware LAST (the outer layer). The previous order had
+        // them reversed, so the limiter ran before auth was set and keyed EVERY
+        // search request by source IP — collapsing all callers (authenticated and
+        // anonymous alike) behind a shared egress IP into a single 300/min bucket
+        // and defeating the per-user design (a fleet-wide search outage under
+        // load). See `search_rate_limit_layer_runs_after_auth`.
         .nest(
             "/search",
             handlers::search::router()
                 .layer(middleware::from_fn_with_state(
-                    auth_service.clone(),
-                    optional_auth_middleware,
-                ))
-                .layer(middleware::from_fn_with_state(
                     search_rate_limit_state,
                     rate_limit_middleware,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    optional_auth_middleware,
                 )),
         )
         // Peer instance routes with auth middleware

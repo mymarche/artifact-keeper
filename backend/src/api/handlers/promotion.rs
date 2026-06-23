@@ -436,6 +436,65 @@ fn ensure_promotion_authorized(is_admin: bool) -> Result<()> {
     Ok(())
 }
 
+/// Pure tenant-ownership decision for one repository in a promotion.
+///
+/// A promotion crosses a tenant boundary when the caller is authorized for one
+/// tenant's repositories but names another tenant's repository as the source or
+/// target. The codebase models tenancy as per-repository role-assignment
+/// membership (see [`RepositoryService::user_can_access_repo`] and the
+/// `require_repo_write_access` write gate): a caller "owns" a private repo only
+/// if they hold a role assignment scoped to it (direct) or a global,
+/// NULL-scoped assignment (the genuine super-admin seeded in migration 002).
+///
+/// Unlike `require_repo_write_access`, this check does NOT blanket-bypass on the
+/// global `is_admin` flag. The `is_admin` boolean is a capability flag, not a
+/// tenant identity: in a multi-tenant deployment each tenant has admin-capable
+/// principals, and the cross-tenant promote-injection finding (campaign-#4
+/// systemic authz pattern) was reproduced by exactly such a principal promoting
+/// a corp artifact into a globex repository. Defense-in-depth therefore demands
+/// the tenant-ownership check be enforced independent of the admin flag: a
+/// genuine super-admin still passes via their NULL-scoped grant, while a
+/// tenant-scoped admin is rejected for a repository in a tenant they do not own.
+///
+/// Public repositories carry no tenant boundary, so they always pass — mirroring
+/// the public-repo short-circuit in `require_repo_write_access` / `require_visible`.
+///
+/// Split out as a pure boolean so the allow/deny decision is unit-testable
+/// without a database; the DB lookup lives in [`require_promotion_tenant_access`].
+fn promotion_tenant_access_allowed(repo_is_public: bool, has_repo_grant: bool) -> bool {
+    repo_is_public || has_repo_grant
+}
+
+/// Enforce tenant ownership on BOTH the source and target repositories of a
+/// promotion before any copy/insert happens.
+///
+/// Rejects cross-tenant promotion (e.g. a corp-tenant artifact promoted into a
+/// globex-tenant repository) with HTTP 403. Applied to every promote path —
+/// single, bulk, and the approval-execute path — so the governance workflow
+/// cannot be used to launder an artifact across the tenant boundary.
+///
+/// The denial is an `Authorization` error (403) rather than `NotFound` because
+/// the caller, being admin-capable, already proved knowledge of the repository
+/// keys via the source/target lookups; the 403 names which repository is out of
+/// the caller's tenant so legitimate operators get an actionable message.
+pub(crate) async fn require_promotion_tenant_access(
+    repo_service: &RepositoryService,
+    user_id: Uuid,
+    source: &crate::models::repository::Repository,
+    target: &crate::models::repository::Repository,
+) -> Result<()> {
+    for repo in [source, target] {
+        let has_grant = repo_service.user_can_access_repo(repo.id, user_id).await?;
+        if !promotion_tenant_access_allowed(repo.is_public, has_grant) {
+            return Err(AppError::Authorization(format!(
+                "You are not authorized to promote into the '{}' repository's tenant",
+                repo.key
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn failed_response(source: String, target: String, message: String) -> PromotionResponse {
     PromotionResponse {
         promoted: false,
@@ -445,6 +504,25 @@ fn failed_response(source: String, target: String, message: String) -> Promotion
         policy_violations: vec![],
         message: Some(message),
     }
+}
+
+/// Flatten failing promotion-rule evaluations into the [`PolicyViolation`] shape
+/// used by the promotion response, tagging each with the rule name. Pure so it is
+/// unit-testable without a DB. Returns an empty vec when there are no failing
+/// rules.
+fn rule_violations_to_policy_violations(
+    failing: &[crate::services::promotion_rule_service::RuleEvaluationResult],
+) -> Vec<PolicyViolation> {
+    failing
+        .iter()
+        .flat_map(|e| {
+            e.violations.iter().map(move |v| PolicyViolation {
+                rule: e.rule_name.clone(),
+                severity: "high".to_string(),
+                message: v.clone(),
+            })
+        })
+        .collect()
 }
 
 #[utoipa::path(
@@ -486,6 +564,13 @@ pub async fn promote_artifact(
     enforce_release_target_link(&state.db, source_repo.id, &target_key).await?;
 
     let target_repo = repo_service.get_by_key(&target_key).await?;
+
+    // Tenant-ownership gate (campaign-#4 systemic authz). The admin-capability
+    // check above does NOT bind the caller to a tenant; without this, an
+    // admin-capable corp principal could promote into a globex repository. Reject
+    // cross-tenant promotion on either the source or target repo with 403.
+    require_promotion_tenant_access(&repo_service, auth.user_id, &source_repo, &target_repo)
+        .await?;
 
     // Look up the artifact first. The artifact lookup is keyed by the source
     // repository id, not by repository type, so it works even when the source
@@ -598,6 +683,30 @@ pub async fn promote_artifact(
                 promotion_id: None,
                 policy_violations,
                 message: Some("Promotion blocked by policy violations".to_string()),
+            }));
+        }
+    }
+
+    // Enforce the per-pair promotion_rules (min_staging_hours, require_signature,
+    // min_health_score, max_cve_severity, ...) created via /api/v1/promotion-rules.
+    // These are a separate policy system from PromotionPolicyService above; reuse
+    // the same evaluator the advisory /evaluate dry-run uses so enforcement and
+    // dry-run can never diverge. Gated behind `skip_policy_check` to match the
+    // other promotion gates' documented admin override.
+    if !req.skip_policy_check {
+        let rule_service =
+            crate::services::promotion_rule_service::PromotionRuleService::new(state.db.clone());
+        let failing = rule_service
+            .evaluate_for_promotion(artifact_id, source_repo.id, target_repo.id)
+            .await?;
+        if !failing.is_empty() {
+            return Ok(Json(PromotionResponse {
+                promoted: false,
+                source: format!("{}/{}", repo_key, artifact.path),
+                target: format!("{}/{}", target_key, artifact.path),
+                promotion_id: None,
+                policy_violations: rule_violations_to_policy_violations(&failing),
+                message: Some("Promotion blocked by promotion rule violations".to_string()),
             }));
         }
     }
@@ -741,6 +850,12 @@ pub async fn promote_artifacts_bulk(
     let target_repo = repo_service.get_by_key(&target_key).await?;
     validate_promotion_repos(&source_repo, &target_repo)?;
 
+    // Tenant-ownership gate (campaign-#4 systemic authz). Enforced once for the
+    // whole batch since source/target are fixed across all items; rejects a
+    // cross-tenant bulk promotion (corp artifacts -> globex repo) with 403.
+    require_promotion_tenant_access(&repo_service, auth.user_id, &source_repo, &target_repo)
+        .await?;
+
     let mut results = Vec::new();
     let mut promoted = 0;
     let mut failed = 0;
@@ -787,6 +902,42 @@ pub async fn promote_artifacts_bulk(
 
         let source_display = format!("{}/{}", repo_key, artifact.path);
         let target_display = format!("{}/{}", target_key, artifact.path);
+
+        // Enforce per-pair promotion_rules per item before copying. Mirrors the
+        // single-promote gate; a rule-blocked item fails and the batch continues
+        // so the rest of the artifacts remain promotable. Honors the
+        // skip_policy_check admin override.
+        if !req.skip_policy_check {
+            let rule_service = crate::services::promotion_rule_service::PromotionRuleService::new(
+                state.db.clone(),
+            );
+            match rule_service
+                .evaluate_for_promotion(*artifact_id, source_repo.id, target_repo.id)
+                .await
+            {
+                Ok(failing) if !failing.is_empty() => {
+                    failed += 1;
+                    let mut resp = failed_response(
+                        source_display,
+                        target_display,
+                        "Promotion blocked by promotion rule violations".to_string(),
+                    );
+                    resp.policy_violations = rule_violations_to_policy_violations(&failing);
+                    results.push(resp);
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    failed += 1;
+                    results.push(failed_response(
+                        source_display,
+                        target_display,
+                        format!("Rule evaluation error: {}", e),
+                    ));
+                    continue;
+                }
+            }
+        }
 
         let source_storage = state.storage_for_repo(&source_repo.storage_location())?;
         let target_storage = state.storage_for_repo(&target_repo.storage_location())?;
@@ -1365,6 +1516,65 @@ mod tests {
         assert!(ensure_promotion_authorized(true).is_ok());
     }
 
+    // -----------------------------------------------------------------------
+    // rule_violations_to_policy_violations (promotion_rules -> response shape)
+    // -----------------------------------------------------------------------
+
+    fn rule_eval(
+        name: &str,
+        passed: bool,
+        violations: &[&str],
+    ) -> crate::services::promotion_rule_service::RuleEvaluationResult {
+        crate::services::promotion_rule_service::RuleEvaluationResult {
+            rule_id: Uuid::new_v4(),
+            rule_name: name.to_string(),
+            passed,
+            violations: violations.iter().map(|v| v.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_rule_violations_empty_when_no_failing_rules() {
+        let out = rule_violations_to_policy_violations(&[]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_rule_violations_single_failing_rule_maps_name_and_messages() {
+        let failing = vec![rule_eval(
+            "strict-release",
+            false,
+            &[
+                "Artifact does not have a valid signature",
+                "Health score 20 < 100",
+            ],
+        )];
+        let out = rule_violations_to_policy_violations(&failing);
+        assert_eq!(out.len(), 2);
+        for v in &out {
+            assert_eq!(v.rule, "strict-release");
+            assert_eq!(v.severity, "high");
+        }
+        assert_eq!(out[0].message, "Artifact does not have a valid signature");
+        assert_eq!(out[1].message, "Health score 20 < 100");
+    }
+
+    #[test]
+    fn test_rule_violations_many_failing_rules_flattened() {
+        let failing = vec![
+            rule_eval("rule-a", false, &["a1", "a2"]),
+            rule_eval("rule-b", false, &["b1"]),
+        ];
+        let out = rule_violations_to_policy_violations(&failing);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].rule, "rule-a");
+        assert_eq!(out[0].message, "a1");
+        assert_eq!(out[1].rule, "rule-a");
+        assert_eq!(out[1].message, "a2");
+        assert_eq!(out[2].rule, "rule-b");
+        assert_eq!(out[2].message, "b1");
+    }
+
     #[test]
     fn test_ensure_promotion_authorized_non_admin_denied() {
         let err = ensure_promotion_authorized(false).unwrap_err();
@@ -1372,6 +1582,35 @@ mod tests {
         // the approval workflow's approve/reject endpoints.
         assert!(matches!(err, AppError::Authorization(_)));
         assert!(err.to_string().contains("admin"));
+    }
+
+    // -----------------------------------------------------------------------
+    // promotion_tenant_access_allowed (cross-tenant promote-target gate)
+    //
+    // Pure decision behind require_promotion_tenant_access. A repo passes the
+    // tenant-ownership gate when it is public OR the caller holds a grant on it
+    // (per-repo or global NULL-scoped). The is_admin capability flag is NOT a
+    // tenant identity, so it is intentionally absent here.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tenant_access_public_repo_always_allowed() {
+        // Public repos carry no tenant boundary, so they pass even without a grant.
+        assert!(promotion_tenant_access_allowed(true, false));
+        assert!(promotion_tenant_access_allowed(true, true));
+    }
+
+    #[test]
+    fn test_tenant_access_private_with_grant_allowed() {
+        // A genuine super-admin (NULL-scoped grant) or a same-tenant operator
+        // holds a grant on the private repo -> allowed.
+        assert!(promotion_tenant_access_allowed(false, true));
+    }
+
+    #[test]
+    fn test_tenant_access_private_without_grant_denied() {
+        // The cross-tenant case: private repo in another tenant, no grant -> deny.
+        assert!(!promotion_tenant_access_allowed(false, false));
     }
 
     // -----------------------------------------------------------------------
@@ -2711,5 +2950,689 @@ mod tests {
         assert!(matches!(err, AppError::NotFound(_)), "got {:?}", err);
         // Target must remain untouched.
         assert!(target.received.lock().unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // DB-backed promotion_rules enforcement tests (PR #1940).
+    //
+    // These exercise the new promotion_rules gate on the SINGLE and BULK
+    // promote handlers, plus the `max_cve_severity` unset-vs-set default fix
+    // via the shared evaluator. They run under `cargo llvm-cov --lib` with a
+    // live DATABASE_URL (the CI coverage job), and runtime-skip cleanly when
+    // no DATABASE_URL is configured (NOT `#[ignore]`, so the coverage instrument
+    // sees these paths). Mirrors the in-`src` DB-test pattern used elsewhere in
+    // this crate (e.g. quality_gates.rs): `let Some(pool) = try_pool().await
+    // else { return; };`.
+    //
+    // Relocated from backend/tests/promotion_rules_gate_tests.rs, which lived in
+    // the integration target and therefore did not count toward `--lib`
+    // coverage.
+    // -----------------------------------------------------------------------
+    mod gate_db {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::auth::AuthExtension;
+        use crate::api::SharedState;
+        use crate::services::promotion_rule_service::PromotionRuleService;
+        use sqlx::PgPool;
+        use std::sync::Arc;
+
+        /// Create a hosted ('local') repo with its own filesystem storage dir.
+        async fn make_repo_key(pool: &PgPool, tag: &str, storage_path: &std::path::Path) -> String {
+            let id = Uuid::new_v4();
+            let key = format!("pr1940-{}-{}", tag, &id.to_string()[..8]);
+            std::fs::create_dir_all(storage_path).expect("create storage dir");
+            sqlx::query(
+                "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public) \
+                 VALUES ($1, $2, $2, $3, 'local', 'generic'::repository_format, false)",
+            )
+            .bind(id)
+            .bind(&key)
+            .bind(storage_path.to_string_lossy().as_ref())
+            .execute(pool)
+            .await
+            .expect("insert repo");
+            key
+        }
+
+        async fn repo_id_for_key(pool: &PgPool, key: &str) -> Uuid {
+            let (id,): (Uuid,) = sqlx::query_as("SELECT id FROM repositories WHERE key = $1")
+                .bind(key)
+                .fetch_one(pool)
+                .await
+                .expect("repo id");
+            id
+        }
+
+        async fn make_admin(pool: &PgPool, tag: &str) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active) \
+                 VALUES ($1, $2, $3, 'x', 'local', true, true)",
+            )
+            .bind(id)
+            .bind(format!("pr1940-{}-{}", tag, &id.to_string()[..8]))
+            .bind(format!("pr1940-{}-{}@test.local", tag, &id.to_string()[..8]))
+            .execute(pool)
+            .await
+            .expect("insert user");
+            // Grant a global (NULL-scoped) admin role assignment, mirroring the
+            // genuine super-admin seeded by migration 002. The promotion
+            // tenant-ownership gate requires a grant on the source/target repos;
+            // a NULL-scoped assignment satisfies it for every repository, which is
+            // exactly what a real cross-tenant super-admin holds.
+            sqlx::query(
+                "INSERT INTO role_assignments (user_id, role_id) \
+                 SELECT $1, r.id FROM roles r WHERE r.name = 'admin'",
+            )
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("grant global admin role");
+            id
+        }
+
+        /// Create a non-super-admin user that is admin-capable (the `is_admin`
+        /// capability flag is true) but tenant-scoped: it holds NO global,
+        /// NULL-scoped role assignment, only the per-repo grants explicitly added
+        /// via `grant_repo`. This models a tenant admin (e.g. a corp admin) in a
+        /// multi-tenant deployment for the cross-tenant promotion tests.
+        async fn make_tenant_admin(pool: &PgPool, tag: &str) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active) \
+                 VALUES ($1, $2, $3, 'x', 'local', true, true)",
+            )
+            .bind(id)
+            .bind(format!("pr1940-{}-{}", tag, &id.to_string()[..8]))
+            .bind(format!("pr1940-{}-{}@test.local", tag, &id.to_string()[..8]))
+            .execute(pool)
+            .await
+            .expect("insert tenant admin");
+            id
+        }
+
+        /// Grant `user` the `developer` role scoped to a single repository,
+        /// mirroring the owner auto-grant in `RepositoryService::create`. Used to
+        /// place a tenant admin inside one tenant's repositories only.
+        async fn grant_repo(pool: &PgPool, user: Uuid, repo: Uuid) {
+            sqlx::query(
+                "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+                 SELECT $1, r.id, $2 FROM roles r WHERE r.name = 'developer' \
+                 ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
+            )
+            .bind(user)
+            .bind(repo)
+            .execute(pool)
+            .await
+            .expect("grant per-repo developer role");
+        }
+
+        fn admin_ext(user_id: Uuid) -> AuthExtension {
+            AuthExtension {
+                user_id,
+                username: "pr1940-admin".to_string(),
+                email: "pr1940-admin@test.local".to_string(),
+                is_admin: true,
+                is_api_token: false,
+                is_service_account: false,
+                scopes: None,
+                allowed_repo_ids: None,
+            }
+        }
+
+        /// Storage backend resolved through the repo's own storage_location().
+        async fn storage_for(
+            state: &SharedState,
+            pool: &PgPool,
+            repo_id: Uuid,
+        ) -> Arc<dyn crate::storage::StorageBackend> {
+            let repo = RepositoryService::new(pool.clone())
+                .get_by_id(repo_id)
+                .await
+                .expect("get_by_id");
+            state
+                .storage_for_repo(&repo.storage_location())
+                .expect("storage_for_repo")
+        }
+
+        /// Insert an artifact whose `created_at` is now() with real bytes in the
+        /// repo's storage, so any positive `min_staging_hours` rule is violated.
+        async fn make_artifact(
+            pool: &PgPool,
+            repo_id: Uuid,
+            storage: &Arc<dyn crate::storage::StorageBackend>,
+            name: &str,
+        ) -> Uuid {
+            let id = Uuid::new_v4();
+            let path = format!("{}/{}", name, id);
+            let bytes = bytes::Bytes::from_static(b"pr1940-artifact-content");
+            let checksum = {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(&bytes);
+                format!("{:x}", h.finalize())
+            };
+            storage.put(&path, bytes).await.expect("write storage");
+            sqlx::query(
+                r#"
+                INSERT INTO artifacts (id, repository_id, name, path, version, size_bytes,
+                                       checksum_sha256, content_type, storage_key, is_deleted)
+                VALUES ($1, $2, $3, $4, '1.0.0', 23, $5, 'application/octet-stream', $4, false)
+                "#,
+            )
+            .bind(id)
+            .bind(repo_id)
+            .bind(name)
+            .bind(&path)
+            .bind(&checksum)
+            .execute(pool)
+            .await
+            .expect("insert artifact");
+            id
+        }
+
+        async fn make_rule(
+            pool: &PgPool,
+            source: Uuid,
+            target: Uuid,
+            max_cve_severity: Option<&str>,
+            min_staging_hours: Option<i32>,
+        ) {
+            sqlx::query(
+                "INSERT INTO promotion_rules (id, name, source_repo_id, target_repo_id, is_enabled, \
+                 max_cve_severity, require_signature, min_staging_hours, auto_promote) \
+                 VALUES ($1, $2, $3, $4, true, $5, false, $6, false)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(format!("pr1940-rule-{}", &Uuid::new_v4().to_string()[..8]))
+            .bind(source)
+            .bind(target)
+            .bind(max_cve_severity)
+            .bind(min_staging_hours)
+            .execute(pool)
+            .await
+            .expect("insert rule");
+        }
+
+        async fn target_has_artifact(pool: &PgPool, target: Uuid, path_like: &str) -> bool {
+            let (n,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path LIKE $2 AND is_deleted = false",
+            )
+            .bind(target)
+            .bind(format!("%{}%", path_like))
+            .fetch_one(pool)
+            .await
+            .expect("count");
+            n > 0
+        }
+
+        async fn cleanup(pool: &PgPool, repos: &[Uuid], user: Uuid) {
+            for r in repos {
+                let _ = sqlx::query(
+                    "DELETE FROM promotion_approvals WHERE source_repo_id = $1 OR target_repo_id = $1",
+                )
+                .bind(r)
+                .execute(pool)
+                .await;
+                let _ = sqlx::query(
+                    "DELETE FROM promotion_history WHERE source_repo_id = $1 OR target_repo_id = $1",
+                )
+                .bind(r)
+                .execute(pool)
+                .await;
+                let _ = sqlx::query(
+                    "DELETE FROM promotion_rules WHERE source_repo_id = $1 OR target_repo_id = $1",
+                )
+                .bind(r)
+                .execute(pool)
+                .await;
+                let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+                    .bind(r)
+                    .execute(pool)
+                    .await;
+                let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                    .bind(r)
+                    .execute(pool)
+                    .await;
+            }
+            let _ = sqlx::query("DELETE FROM role_assignments WHERE user_id = $1")
+                .bind(user)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user)
+                .execute(pool)
+                .await;
+        }
+
+        // ---- tenant-ownership gate on promote target (xtenant) ---------------
+        //
+        // A promotion crosses a tenant boundary when an admin-capable principal
+        // authorized for one tenant's repos names another tenant's repo as the
+        // target. `require_promotion_tenant_access` rejects this with 403 on
+        // every promote path. These tests drive a tenant-scoped admin (per-repo
+        // grants only, NO global NULL-scoped assignment) across the single, bulk,
+        // and approval-execute paths.
+
+        /// Cross-tenant SINGLE promote: tenant admin owns the SOURCE (corp) but
+        /// not the TARGET (globex) -> 403, no copy.
+        #[tokio::test]
+        async fn test_single_promote_cross_tenant_target_blocked() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr-xt-ss-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr-xt-st-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "xt-corp-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "xt-globex-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let corp_admin = make_tenant_admin(&pool, "xt-corp").await;
+            // corp admin owns only the source (corp) repo, NOT the globex target.
+            grant_repo(&pool, corp_admin, src).await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "xt").await;
+
+            let err = promote_artifact(
+                State(state.clone()),
+                Extension(admin_ext(corp_admin)),
+                Path((src_key.clone(), artifact)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect_err("cross-tenant single promote must be rejected");
+            assert!(
+                matches!(err, AppError::Authorization(_)),
+                "cross-tenant promote must be a 403 Authorization error; got {:?}",
+                err
+            );
+            assert!(
+                !target_has_artifact(&pool, tgt, "xt").await,
+                "a cross-tenant single promote must NOT copy the artifact"
+            );
+
+            cleanup(&pool, &[src, tgt], corp_admin).await;
+        }
+
+        /// Same-tenant SINGLE promote: tenant admin owns BOTH repos -> succeeds.
+        #[tokio::test]
+        async fn test_single_promote_same_tenant_allowed() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr-st-ss-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr-st-st-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "st-corp-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "st-corp-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let corp_admin = make_tenant_admin(&pool, "st-corp").await;
+            // corp admin owns BOTH the corp source and corp target.
+            grant_repo(&pool, corp_admin, src).await;
+            grant_repo(&pool, corp_admin, tgt).await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "st").await;
+
+            let res = promote_artifact(
+                State(state.clone()),
+                Extension(admin_ext(corp_admin)),
+                Path((src_key.clone(), artifact)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("same-tenant single promote must succeed");
+            assert!(res.0.promoted, "same-tenant single promote must promote");
+            assert!(target_has_artifact(&pool, tgt, "st").await);
+
+            cleanup(&pool, &[src, tgt], corp_admin).await;
+        }
+
+        /// Cross-tenant BULK promote: tenant admin lacks the target tenant -> 403.
+        #[tokio::test]
+        async fn test_bulk_promote_cross_tenant_target_blocked() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr-xtb-ss-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr-xtb-st-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "xtb-corp-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "xtb-globex-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let corp_admin = make_tenant_admin(&pool, "xtb-corp").await;
+            grant_repo(&pool, corp_admin, src).await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "xtb").await;
+
+            let err = promote_artifacts_bulk(
+                State(state.clone()),
+                Extension(admin_ext(corp_admin)),
+                Path(src_key.clone()),
+                Json(BulkPromoteRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    artifact_ids: vec![artifact],
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect_err("cross-tenant bulk promote must be rejected");
+            assert!(
+                matches!(err, AppError::Authorization(_)),
+                "cross-tenant bulk promote must be a 403; got {:?}",
+                err
+            );
+            assert!(
+                !target_has_artifact(&pool, tgt, "xtb").await,
+                "a cross-tenant bulk promote must NOT copy the artifact"
+            );
+
+            cleanup(&pool, &[src, tgt], corp_admin).await;
+        }
+
+        // ---- single-promote handler: rule-MET promotes -----------------------
+
+        #[tokio::test]
+        async fn test_single_promote_rule_met_promotes() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr1940-sok-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr1940-sok-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "sok-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "sok-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "sok").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "sok").await;
+            // Satisfied rule: min_staging_hours = 0, no CVE gate.
+            make_rule(&pool, src, tgt, None, Some(0)).await;
+
+            let res = promote_artifact(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path((src_key.clone(), artifact)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("promote should succeed");
+            assert!(res.0.promoted, "a rule-met single promote must promote");
+            assert!(
+                target_has_artifact(&pool, tgt, "sok").await,
+                "rule-met single promote must copy the artifact into the target"
+            );
+
+            cleanup(&pool, &[src, tgt], user).await;
+        }
+
+        // ---- single-promote handler: rule-UNMET blocks -----------------------
+
+        #[tokio::test]
+        async fn test_single_promote_rule_unmet_blocks() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr1940-sno-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr1940-sno-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "sno-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "sno-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "sno").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "sno").await;
+            // The live-bypass rule: 720h staging on a seconds-old artifact.
+            make_rule(&pool, src, tgt, None, Some(720)).await;
+
+            let res = promote_artifact(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path((src_key.clone(), artifact)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("handler returns Ok with promoted:false on a rule block");
+            assert!(
+                !res.0.promoted,
+                "a rule-unmet single promote must be blocked"
+            );
+            assert!(
+                res.0
+                    .message
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("promotion rule"),
+                "block message must cite the promotion rule; got {:?}",
+                res.0.message
+            );
+            assert!(
+                !res.0.policy_violations.is_empty(),
+                "blocked single promote must surface rule violations"
+            );
+            assert!(
+                !target_has_artifact(&pool, tgt, "sno").await,
+                "a rule-blocked single promote must NOT copy the artifact"
+            );
+
+            cleanup(&pool, &[src, tgt], user).await;
+        }
+
+        // ---- single-promote handler: skip_policy_check override --------------
+
+        #[tokio::test]
+        async fn test_single_promote_skip_policy_check_override() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr1940-ssk-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr1940-ssk-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "ssk-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "ssk-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "ssk").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "ssk").await;
+            make_rule(&pool, src, tgt, None, Some(720)).await;
+
+            let res = promote_artifact(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path((src_key.clone(), artifact)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: true,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("skip_policy_check must bypass the rule gate");
+            assert!(res.0.promoted, "break-glass single promote must promote");
+            assert!(target_has_artifact(&pool, tgt, "ssk").await);
+
+            cleanup(&pool, &[src, tgt], user).await;
+        }
+
+        // ---- bulk-promote handler: rule-MET vs rule-UNMET --------------------
+
+        #[tokio::test]
+        async fn test_bulk_promote_rule_met_and_unmet() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr1940-bulk-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr1940-bulk-t-{}", Uuid::new_v4()));
+            // rule-MET case
+            let met_s_key = make_repo_key(&pool, "bok-s", &sdir).await;
+            let met_t_key = make_repo_key(&pool, "bok-t", &tdir).await;
+            let met_s = repo_id_for_key(&pool, &met_s_key).await;
+            let met_t = repo_id_for_key(&pool, &met_t_key).await;
+            let user = make_admin(&pool, "bulk").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let met_storage = storage_for(&state, &pool, met_s).await;
+            let met_art = make_artifact(&pool, met_s, &met_storage, "bok").await;
+            make_rule(&pool, met_s, met_t, None, Some(0)).await;
+
+            let met_res = promote_artifacts_bulk(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(met_s_key.clone()),
+                Json(BulkPromoteRequest {
+                    target_repository: Some(met_t_key.clone()),
+                    artifact_ids: vec![met_art],
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("bulk promote ok");
+            assert_eq!(met_res.0.promoted, 1, "rule-met bulk item must promote");
+            assert_eq!(met_res.0.failed, 0);
+            assert!(target_has_artifact(&pool, met_t, "bok").await);
+
+            // rule-UNMET case (separate repo pair).
+            let sdir2 = std::env::temp_dir().join(format!("pr1940-bno-s-{}", Uuid::new_v4()));
+            let tdir2 = std::env::temp_dir().join(format!("pr1940-bno-t-{}", Uuid::new_v4()));
+            let no_s_key = make_repo_key(&pool, "bno-s", &sdir2).await;
+            let no_t_key = make_repo_key(&pool, "bno-t", &tdir2).await;
+            let no_s = repo_id_for_key(&pool, &no_s_key).await;
+            let no_t = repo_id_for_key(&pool, &no_t_key).await;
+            let no_storage = storage_for(&state, &pool, no_s).await;
+            let no_art = make_artifact(&pool, no_s, &no_storage, "bno").await;
+            make_rule(&pool, no_s, no_t, None, Some(720)).await;
+
+            let no_res = promote_artifacts_bulk(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(no_s_key.clone()),
+                Json(BulkPromoteRequest {
+                    target_repository: Some(no_t_key.clone()),
+                    artifact_ids: vec![no_art],
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("bulk promote ok");
+            assert_eq!(
+                no_res.0.promoted, 0,
+                "rule-unmet bulk item must NOT promote"
+            );
+            assert_eq!(no_res.0.failed, 1);
+            assert!(
+                no_res.0.results[0]
+                    .message
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("promotion rule"),
+                "bulk block must cite the promotion rule; got {:?}",
+                no_res.0.results[0].message
+            );
+            assert!(
+                !no_res.0.results[0].policy_violations.is_empty(),
+                "blocked bulk item must surface rule violations"
+            );
+            assert!(
+                !target_has_artifact(&pool, no_t, "bno").await,
+                "a rule-blocked bulk item must NOT copy the artifact"
+            );
+
+            cleanup(&pool, &[met_s, met_t, no_s, no_t], user).await;
+        }
+
+        // ---- max_cve_severity default fix (shared evaluator) -----------------
+
+        /// #1940: a rule that does NOT set max_cve_severity (NULL) must NOT
+        /// silently require a clean scan, so an unscanned artifact under a
+        /// satisfied hours-only rule is not falsely blocked.
+        #[tokio::test]
+        async fn test_unset_cve_severity_does_not_require_scan() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr1940-nocve-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr1940-nocve-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "nocve-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "nocve-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "nocve").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            // Unscanned artifact (no scan_results rows).
+            let artifact = make_artifact(&pool, src, &storage, "nocve").await;
+            make_rule(&pool, src, tgt, None, Some(0)).await;
+
+            let svc = PromotionRuleService::new(pool.clone());
+            let failing = svc
+                .evaluate_for_promotion(artifact, src, tgt)
+                .await
+                .expect("evaluate");
+            assert!(
+                failing.is_empty(),
+                "an hours-only rule (max_cve_severity NULL) must NOT block an unscanned artifact; got {:?}",
+                failing
+            );
+
+            cleanup(&pool, &[src, tgt], user).await;
+        }
+
+        /// Conservative counterpart: a rule that DOES set max_cve_severity still
+        /// blocks an unscanned artifact (the CVE gate is opt-in, fail-closed when
+        /// requested).
+        #[tokio::test]
+        async fn test_explicit_cve_severity_still_requires_scan() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr1940-cve-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr1940-cve-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "cve-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "cve-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "cve").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "cve").await;
+            // Explicit CVE bound + satisfied hours -> unscanned must fail closed.
+            make_rule(&pool, src, tgt, Some("medium"), Some(0)).await;
+
+            let svc = PromotionRuleService::new(pool.clone());
+            let failing = svc
+                .evaluate_for_promotion(artifact, src, tgt)
+                .await
+                .expect("evaluate");
+            assert!(
+                !failing.is_empty(),
+                "an explicit max_cve_severity rule must still block an unscanned artifact (fail-closed)"
+            );
+
+            cleanup(&pool, &[src, tgt], user).await;
+        }
     }
 }

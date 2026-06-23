@@ -12,7 +12,18 @@ use utoipa::{Modify, OpenApi};
 #[openapi(
     info(
         title = "Artifact Keeper API",
-        description = "Enterprise artifact registry supporting 45+ package formats.",
+        description = "Enterprise artifact registry supporting 45+ package formats.\n\n\
+## Authentication\n\n\
+The JSON management API under `/api/v1/*` accepts **API tokens only as `Authorization: Bearer <token>`**. \
+This is the canonical scheme for programmatic access; JWTs issued by the login flow also use `Bearer`. \
+HTTP Basic credentials on `/api/v1/*` are validated *only* as a real `username:password` login — the \
+password half is **not** retried as an API token. A request to `/api/v1/*` that sends an API token in the \
+password field of Basic auth therefore returns `401 AUTH_ERROR`; switch to `Authorization: Bearer <token>`.\n\n\
+Format (package-manager) endpoints such as `/v2/*` (OCI), `/incus/*`, `/debian/*`, and the language \
+registries are intentionally more permissive for client compatibility: in addition to Bearer, they accept \
+HTTP **Basic** auth with the API token supplied in the *password* field (any username), matching the \
+`pip` netrc / Artifactory-style `token:<api_token>` convention used by package managers that cannot send a \
+Bearer header. This Basic-with-token fallback applies to format endpoints only, never to `/api/v1/*`.",
         version = "1.2.1",
         license(name = "MIT", url = "https://opensource.org/licenses/MIT"),
         contact(name = "Artifact Keeper", url = "https://artifactkeeper.com")
@@ -65,7 +76,16 @@ pub struct ErrorResponse {
     pub message: String,
 }
 
-/// Adds Bearer JWT security scheme to the OpenAPI spec.
+/// Adds the supported security schemes to the OpenAPI spec.
+///
+/// `bearer_auth` is the canonical scheme for `/api/v1/*`: API tokens and
+/// login-issued JWTs are both sent as `Authorization: Bearer <token>`.
+///
+/// `basic_auth` is documented for the format (package-manager) endpoints
+/// only. Those endpoints additionally accept HTTP Basic with the API token in
+/// the password field for clients that cannot send a Bearer header. The
+/// `/api/v1/*` middleware does NOT honour the Basic-with-token fallback — see
+/// the API description for the asymmetry.
 struct SecurityAddon;
 
 impl Modify for SecurityAddon {
@@ -77,6 +97,24 @@ impl Modify for SecurityAddon {
                     HttpBuilder::new()
                         .scheme(HttpAuthScheme::Bearer)
                         .bearer_format("JWT")
+                        .description(Some(
+                            "Canonical scheme for `/api/v1/*`. Send an API token or a \
+                             login-issued JWT as `Authorization: Bearer <token>`.",
+                        ))
+                        .build(),
+                ),
+            );
+            components.add_security_scheme(
+                "basic_auth",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Basic)
+                        .description(Some(
+                            "Format (package-manager) endpoints only. Accepts a \
+                             `username:password` login, or an API token in the password \
+                             field (any username) for `pip` netrc / Artifactory-style \
+                             clients. Not accepted as a token carrier on `/api/v1/*`.",
+                        ))
                         .build(),
                 ),
             );
@@ -173,6 +211,23 @@ mod tests {
             .is_some_and(|c| c.security_schemes.contains_key("bearer_auth"));
         assert!(has_bearer, "Bearer auth security scheme is missing.");
 
+        // The format-endpoint Basic scheme is documented so the auth asymmetry
+        // (Basic-with-token works on format endpoints but not /api/v1/*) is
+        // discoverable from the spec rather than only the middleware source.
+        let has_basic = spec
+            .components
+            .as_ref()
+            .is_some_and(|c| c.security_schemes.contains_key("basic_auth"));
+        assert!(has_basic, "Basic auth security scheme is missing.");
+
+        // The API description must spell out the asymmetry: Bearer is canonical
+        // for /api/v1/*, and the Basic-with-token fallback is format-only.
+        let description = spec.info.description.as_deref().unwrap_or_default();
+        assert!(
+            description.contains("Bearer") && description.contains("/api/v1/*"),
+            "API description should document Bearer auth for /api/v1/*."
+        );
+
         // Verify all expected tags are present
         let tags: Vec<&str> = spec
             .tags
@@ -232,6 +287,56 @@ mod tests {
         assert!(
             op_count >= 250,
             "Expected at least 250 operations, got {op_count}. Handler annotations may be missing."
+        );
+    }
+
+    /// Regression: every operation must have a globally unique `operationId`.
+    /// utoipa derives it from the handler fn name by default, so two handlers
+    /// that share a name (e.g. `reject_artifact` in both promotion.rs and
+    /// quarantine.rs) silently produce a duplicate `operationId`. That fails the
+    /// artifact-keeper-api spectral gate (`operation-operationId-unique`), which
+    /// skips ALL SDK generation/publishing for the release — the reason the
+    /// published `@artifact-keeper/sdk` stalled at 1.1.6. Catch it here, in
+    /// backend CI, instead of discovering it after a release tag is cut.
+    #[test]
+    fn test_openapi_operation_ids_are_unique() {
+        use std::collections::HashMap;
+
+        let spec = build_openapi();
+        let mut seen: HashMap<String, Vec<String>> = HashMap::new();
+
+        for (path, item) in &spec.paths.paths {
+            for (method, op) in [
+                ("GET", &item.get),
+                ("PUT", &item.put),
+                ("POST", &item.post),
+                ("DELETE", &item.delete),
+                ("PATCH", &item.patch),
+                ("HEAD", &item.head),
+            ] {
+                if let Some(op) = op {
+                    if let Some(id) = &op.operation_id {
+                        seen.entry(id.clone())
+                            .or_default()
+                            .push(format!("{method} {path}"));
+                    }
+                }
+            }
+        }
+
+        let mut dups: Vec<String> = seen
+            .iter()
+            .filter(|(_, locs)| locs.len() > 1)
+            .map(|(id, locs)| format!("  {id}: {}", locs.join(", ")))
+            .collect();
+        dups.sort();
+
+        assert!(
+            dups.is_empty(),
+            "Duplicate operationId(s) found — these fail the api-repo spectral gate \
+             and block SDK generation/publishing. Give one handler an explicit \
+             `operation_id = \"...\"` in its #[utoipa::path]:\n{}",
+            dups.join("\n")
         );
     }
 

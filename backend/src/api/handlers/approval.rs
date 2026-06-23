@@ -84,6 +84,11 @@ pub struct ApprovalListResponse {
 pub struct ReviewRequest {
     /// Optional reviewer notes
     pub notes: Option<String>,
+    /// Admin break-glass override: skip promotion_rules enforcement at approve
+    /// time. Mirrors `skip_policy_check` on the single/bulk promote endpoints so
+    /// the approval-execute path has the same documented escape hatch.
+    #[serde(default)]
+    pub skip_policy_check: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -147,6 +152,26 @@ impl ApprovalRow {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Separation-of-duties (four-eyes) decision: may `approver` approve a promotion
+/// that was requested by `requester`?
+///
+/// The promotion approval workflow is a control gate: the principal who requests
+/// a promotion must not be the principal who approves it. Without this, a single
+/// admin-capable principal can both `POST /approval/request` and
+/// `POST /approval/{id}/approve` on their own request, collapsing the four-eyes
+/// control into one (the SoD-bypass finding from the 1.2.2 validation campaign).
+///
+/// There is intentionally NO self-approve override: the whole point of the
+/// control is that a second principal signs off, so a break-glass that lets the
+/// requester approve their own request would defeat it. A genuine emergency
+/// promotion path already exists outside the approval workflow (the admin
+/// `skip_policy_check` direct-promote), so this gate stays absolute.
+///
+/// Pure boolean so it is unit-testable without a database.
+fn approval_separation_of_duties_ok(requester: Uuid, approver: Uuid) -> bool {
+    requester != approver
+}
 
 /// Check whether a repository requires approval for promotions.
 pub async fn check_approval_required(db: &sqlx::PgPool, repo_id: Uuid) -> Result<bool> {
@@ -490,11 +515,12 @@ pub async fn approve_promotion(
         artifact_id: Uuid,
         source_repo_id: Uuid,
         target_repo_id: Uuid,
+        requested_by: Uuid,
         status: String,
     }
 
     let approval: SimpleRow = sqlx::query_as(
-        "SELECT id, artifact_id, source_repo_id, target_repo_id, status FROM promotion_approvals WHERE id = $1",
+        "SELECT id, artifact_id, source_repo_id, target_repo_id, requested_by, status FROM promotion_approvals WHERE id = $1",
     )
     .bind(approval_id)
     .fetch_optional(&state.db)
@@ -507,6 +533,19 @@ pub async fn approve_promotion(
             "Approval request has already been {}",
             approval.status
         )));
+    }
+
+    // Separation of duties (four-eyes). The requester of a promotion must not be
+    // the principal who approves it. Without this an admin-capable principal can
+    // request AND approve their own promotion, collapsing the control gate (the
+    // SoD-bypass finding from the 1.2.2 validation campaign). No self-approve
+    // override: the second-pair-of-eyes requirement is the whole point.
+    if !approval_separation_of_duties_ok(approval.requested_by, auth.user_id) {
+        return Err(AppError::Authorization(
+            "Separation of duties: you cannot approve a promotion you requested. \
+             A different reviewer must approve this request."
+                .to_string(),
+        ));
     }
 
     let repo_service = RepositoryService::new(state.db.clone());
@@ -524,6 +563,19 @@ pub async fn approve_promotion(
 
     let source_repo = repo_service.get_by_key(&source_repo_key.0).await?;
     let target_repo = repo_service.get_by_key(&target_repo_key.0).await?;
+
+    // Tenant-ownership gate (campaign-#4 systemic authz). The admin-capability
+    // check above does NOT bind the approver to a tenant; without this an
+    // admin-capable corp principal could approve a promotion whose target is a
+    // globex repository, laundering an artifact across the tenant boundary via
+    // the governance workflow. Reject cross-tenant approval on either repo with 403.
+    crate::api::handlers::promotion::require_promotion_tenant_access(
+        &repo_service,
+        auth.user_id,
+        &source_repo,
+        &target_repo,
+    )
+    .await?;
 
     #[derive(sqlx::FromRow)]
     #[allow(dead_code)]
@@ -555,6 +607,41 @@ pub async fn approve_promotion(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Artifact not found in source repository".to_string()))?;
+
+    // Enforce the per-pair promotion_rules (min_staging_hours, require_signature,
+    // min_health_score, max_cve_severity, ...) BEFORE copying/inserting. This is
+    // the same gate the single and bulk REST promote handlers apply; the approval
+    // workflow is just a third promote path, and `promote_artifact` FORCES
+    // approval-required repos through it, so without this check governance-ruled
+    // repos (exactly the ones likely to carry rules) bypass the gate entirely.
+    // Reuses the same evaluator as the advisory /evaluate dry-run so enforcement
+    // and dry-run cannot diverge. Honors the `skip_policy_check` admin override.
+    //
+    // Unlike the REST handlers (which return 200 + promoted:false), the approval
+    // execute path returns 403 with the violations: a rule-blocked approval must
+    // NOT execute the copy/insert, so it fails like a rejected promotion.
+    if !req.skip_policy_check {
+        let rule_service =
+            crate::services::promotion_rule_service::PromotionRuleService::new(state.db.clone());
+        let failing = rule_service
+            .evaluate_for_promotion(approval.artifact_id, source_repo.id, target_repo.id)
+            .await?;
+        if !failing.is_empty() {
+            let detail = failing
+                .iter()
+                .flat_map(|e| {
+                    e.violations
+                        .iter()
+                        .map(move |v| format!("{}: {}", e.rule_name, v))
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(AppError::Authorization(format!(
+                "Promotion blocked by promotion rule violations: {}",
+                detail
+            )));
+        }
+    }
 
     // Copy storage content
     let source_storage = state.storage_for_repo(&source_repo.storage_location())?;
@@ -908,6 +995,24 @@ mod tests {
             gate < probe,
             "require_visible must run BEFORE the artifact existence probe (xtenant oracle)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // approval_separation_of_duties_ok (four-eyes SoD decision)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sod_requester_cannot_self_approve() {
+        let p = Uuid::new_v4();
+        // Same principal as requester and approver -> not allowed.
+        assert!(!approval_separation_of_duties_ok(p, p));
+    }
+
+    #[test]
+    fn test_sod_distinct_approver_allowed() {
+        let requester = Uuid::new_v4();
+        let approver = Uuid::new_v4();
+        assert!(approval_separation_of_duties_ok(requester, approver));
     }
 
     // -----------------------------------------------------------------------
@@ -1663,5 +1768,615 @@ mod tests {
         let conditions = vec!["x = 1".to_string()];
         let clause = build_where_clause(&conditions);
         assert!(clause.starts_with(" WHERE"));
+    }
+
+    // -----------------------------------------------------------------------
+    // DB-backed approve_promotion gate tests (PR #1940).
+    //
+    // The approval-execute path (`approve_promotion`) is the THIRD manual
+    // promote path; `promote_artifact` FORCES approval-required repos through
+    // it, so governance-ruled repos bypassed the single/bulk gate entirely
+    // until #1940 added this gate. These drive the real handler end to end.
+    //
+    // Runs under `cargo llvm-cov --lib` with a live DATABASE_URL (CI coverage
+    // job); runtime-skips when no DATABASE_URL is set (NOT `#[ignore]`, so the
+    // coverage instrument sees the gate path). Mirrors the in-`src` DB-test
+    // pattern. Relocated from backend/tests/promotion_rules_gate_tests.rs (an
+    // integration target that did not count toward `--lib` coverage).
+    // -----------------------------------------------------------------------
+    mod gate_db {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::SharedState;
+        use sqlx::PgPool;
+        use std::sync::Arc;
+
+        async fn make_repo_key(pool: &PgPool, tag: &str, storage_path: &std::path::Path) -> String {
+            let id = Uuid::new_v4();
+            let key = format!("pr1940-{}-{}", tag, &id.to_string()[..8]);
+            std::fs::create_dir_all(storage_path).expect("create storage dir");
+            sqlx::query(
+                "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public) \
+                 VALUES ($1, $2, $2, $3, 'local', 'generic'::repository_format, false)",
+            )
+            .bind(id)
+            .bind(&key)
+            .bind(storage_path.to_string_lossy().as_ref())
+            .execute(pool)
+            .await
+            .expect("insert repo");
+            key
+        }
+
+        async fn repo_id_for_key(pool: &PgPool, key: &str) -> Uuid {
+            let (id,): (Uuid,) = sqlx::query_as("SELECT id FROM repositories WHERE key = $1")
+                .bind(key)
+                .fetch_one(pool)
+                .await
+                .expect("repo id");
+            id
+        }
+
+        async fn make_admin(pool: &PgPool, tag: &str) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active) \
+                 VALUES ($1, $2, $3, 'x', 'local', true, true)",
+            )
+            .bind(id)
+            .bind(format!("pr1940-{}-{}", tag, &id.to_string()[..8]))
+            .bind(format!("pr1940-{}-{}@test.local", tag, &id.to_string()[..8]))
+            .execute(pool)
+            .await
+            .expect("insert user");
+            // Grant a global (NULL-scoped) admin role assignment, mirroring the
+            // genuine super-admin seeded by migration 002, so this approver
+            // satisfies the promotion tenant-ownership gate for every repo.
+            sqlx::query(
+                "INSERT INTO role_assignments (user_id, role_id) \
+                 SELECT $1, r.id FROM roles r WHERE r.name = 'admin'",
+            )
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("grant global admin role");
+            id
+        }
+
+        /// A second principal that is the REQUESTER of an approval. Distinct from
+        /// the approver so the separation-of-duties gate is satisfied in the
+        /// rule-gate tests (which predate SoD). Holds no grants; only needs to
+        /// exist as the `requested_by` identity.
+        async fn make_requester(pool: &PgPool, tag: &str) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active) \
+                 VALUES ($1, $2, $3, 'x', 'local', false, true)",
+            )
+            .bind(id)
+            .bind(format!("pr1940-req-{}-{}", tag, &id.to_string()[..8]))
+            .bind(format!("pr1940-req-{}-{}@test.local", tag, &id.to_string()[..8]))
+            .execute(pool)
+            .await
+            .expect("insert requester");
+            id
+        }
+
+        /// Admin-capable but tenant-scoped principal: `is_admin` is true but it
+        /// holds NO global NULL-scoped assignment, only the per-repo grants added
+        /// via `grant_repo`. Models a tenant admin (e.g. corp) for the
+        /// cross-tenant approval test.
+        async fn make_tenant_admin(pool: &PgPool, tag: &str) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active) \
+                 VALUES ($1, $2, $3, 'x', 'local', true, true)",
+            )
+            .bind(id)
+            .bind(format!("pr1940-tadm-{}-{}", tag, &id.to_string()[..8]))
+            .bind(format!("pr1940-tadm-{}-{}@test.local", tag, &id.to_string()[..8]))
+            .execute(pool)
+            .await
+            .expect("insert tenant admin");
+            id
+        }
+
+        async fn grant_repo(pool: &PgPool, user: Uuid, repo: Uuid) {
+            sqlx::query(
+                "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+                 SELECT $1, r.id, $2 FROM roles r WHERE r.name = 'developer' \
+                 ON CONFLICT (user_id, role_id, repository_id) DO NOTHING",
+            )
+            .bind(user)
+            .bind(repo)
+            .execute(pool)
+            .await
+            .expect("grant per-repo developer role");
+        }
+
+        fn admin_ext(user_id: Uuid) -> AuthExtension {
+            AuthExtension {
+                user_id,
+                username: "pr1940-admin".to_string(),
+                email: "pr1940-admin@test.local".to_string(),
+                is_admin: true,
+                is_api_token: false,
+                is_service_account: false,
+                scopes: None,
+                allowed_repo_ids: None,
+            }
+        }
+
+        async fn storage_for(
+            state: &SharedState,
+            pool: &PgPool,
+            repo_id: Uuid,
+        ) -> Arc<dyn crate::storage::StorageBackend> {
+            let repo = RepositoryService::new(pool.clone())
+                .get_by_id(repo_id)
+                .await
+                .expect("get_by_id");
+            state
+                .storage_for_repo(&repo.storage_location())
+                .expect("storage_for_repo")
+        }
+
+        async fn make_artifact(
+            pool: &PgPool,
+            repo_id: Uuid,
+            storage: &Arc<dyn crate::storage::StorageBackend>,
+            name: &str,
+        ) -> Uuid {
+            let id = Uuid::new_v4();
+            let path = format!("{}/{}", name, id);
+            let bytes = bytes::Bytes::from_static(b"pr1940-artifact-content");
+            let checksum = {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(&bytes);
+                format!("{:x}", h.finalize())
+            };
+            storage.put(&path, bytes).await.expect("write storage");
+            sqlx::query(
+                r#"
+                INSERT INTO artifacts (id, repository_id, name, path, version, size_bytes,
+                                       checksum_sha256, content_type, storage_key, is_deleted)
+                VALUES ($1, $2, $3, $4, '1.0.0', 23, $5, 'application/octet-stream', $4, false)
+                "#,
+            )
+            .bind(id)
+            .bind(repo_id)
+            .bind(name)
+            .bind(&path)
+            .bind(&checksum)
+            .execute(pool)
+            .await
+            .expect("insert artifact");
+            id
+        }
+
+        async fn make_rule(
+            pool: &PgPool,
+            source: Uuid,
+            target: Uuid,
+            max_cve_severity: Option<&str>,
+            min_staging_hours: Option<i32>,
+        ) {
+            sqlx::query(
+                "INSERT INTO promotion_rules (id, name, source_repo_id, target_repo_id, is_enabled, \
+                 max_cve_severity, require_signature, min_staging_hours, auto_promote) \
+                 VALUES ($1, $2, $3, $4, true, $5, false, $6, false)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(format!("pr1940-rule-{}", &Uuid::new_v4().to_string()[..8]))
+            .bind(source)
+            .bind(target)
+            .bind(max_cve_severity)
+            .bind(min_staging_hours)
+            .execute(pool)
+            .await
+            .expect("insert rule");
+        }
+
+        async fn make_pending_approval(
+            pool: &PgPool,
+            artifact_id: Uuid,
+            source: Uuid,
+            target: Uuid,
+            requested_by: Uuid,
+        ) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO promotion_approvals (id, artifact_id, source_repo_id, target_repo_id, \
+                 requested_by, status, skip_policy_check) \
+                 VALUES ($1, $2, $3, $4, $5, 'pending', false)",
+            )
+            .bind(id)
+            .bind(artifact_id)
+            .bind(source)
+            .bind(target)
+            .bind(requested_by)
+            .execute(pool)
+            .await
+            .expect("insert approval");
+            id
+        }
+
+        async fn target_has_artifact(pool: &PgPool, target: Uuid, path_like: &str) -> bool {
+            let (n,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path LIKE $2 AND is_deleted = false",
+            )
+            .bind(target)
+            .bind(format!("%{}%", path_like))
+            .fetch_one(pool)
+            .await
+            .expect("count");
+            n > 0
+        }
+
+        async fn approval_status(pool: &PgPool, id: Uuid) -> String {
+            let (s,): (String,) =
+                sqlx::query_as("SELECT status FROM promotion_approvals WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(pool)
+                    .await
+                    .expect("status");
+            s
+        }
+
+        async fn cleanup(pool: &PgPool, repos: &[Uuid], user: Uuid) {
+            for r in repos {
+                let _ = sqlx::query(
+                    "DELETE FROM promotion_approvals WHERE source_repo_id = $1 OR target_repo_id = $1",
+                )
+                .bind(r)
+                .execute(pool)
+                .await;
+                let _ = sqlx::query(
+                    "DELETE FROM promotion_history WHERE source_repo_id = $1 OR target_repo_id = $1",
+                )
+                .bind(r)
+                .execute(pool)
+                .await;
+                let _ = sqlx::query(
+                    "DELETE FROM promotion_rules WHERE source_repo_id = $1 OR target_repo_id = $1",
+                )
+                .bind(r)
+                .execute(pool)
+                .await;
+                let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+                    .bind(r)
+                    .execute(pool)
+                    .await;
+                let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                    .bind(r)
+                    .execute(pool)
+                    .await;
+            }
+            let _ = sqlx::query("DELETE FROM role_assignments WHERE user_id = $1")
+                .bind(user)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user)
+                .execute(pool)
+                .await;
+        }
+
+        /// Delete an auxiliary user (e.g. the requester) and any role assignments
+        /// it holds. Used in addition to `cleanup` when a test creates a distinct
+        /// requester or a second tenant principal.
+        async fn cleanup_user(pool: &PgPool, user: Uuid) {
+            let _ = sqlx::query("DELETE FROM role_assignments WHERE user_id = $1")
+                .bind(user)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user)
+                .execute(pool)
+                .await;
+        }
+
+        /// The gap PR #1940 closed: approving a rule-UNMET promotion must be
+        /// BLOCKED (403 Authorization), must NOT copy the artifact, and must
+        /// leave the approval pending.
+        #[tokio::test]
+        async fn test_approval_path_blocks_rule_unmet() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr1940-arej-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr1940-arej-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "arej-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "arej-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "arej").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "arej").await;
+            make_rule(&pool, src, tgt, None, Some(720)).await;
+            // Distinct requester so the SoD gate (requester != approver) passes
+            // and the rule gate is the one under test.
+            let requester = make_requester(&pool, "arej").await;
+            let approval = make_pending_approval(&pool, artifact, src, tgt, requester).await;
+
+            let res = approve_promotion(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(approval),
+                Json(ReviewRequest {
+                    notes: None,
+                    skip_policy_check: false,
+                }),
+            )
+            .await;
+            match res {
+                Err(AppError::Authorization(msg)) => assert!(
+                    msg.contains("promotion rule"),
+                    "block message should cite the rule; got: {msg}"
+                ),
+                other => panic!(
+                    "expected Authorization (403) block, got ok={:?}",
+                    other.is_ok()
+                ),
+            }
+            assert!(
+                !target_has_artifact(&pool, tgt, "arej").await,
+                "a rule-blocked approval must NOT copy the artifact"
+            );
+            assert_eq!(
+                approval_status(&pool, approval).await,
+                "pending",
+                "a blocked approval must remain pending"
+            );
+
+            cleanup(&pool, &[src, tgt], user).await;
+            cleanup_user(&pool, requester).await;
+        }
+
+        /// A rule-MET approval still executes: the artifact lands in the target
+        /// and the approval is marked approved.
+        #[tokio::test]
+        async fn test_approval_path_allows_rule_met() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr1940-aok-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr1940-aok-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "aok-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "aok-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "aok").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "aok").await;
+            make_rule(&pool, src, tgt, None, Some(0)).await;
+            let requester = make_requester(&pool, "aok").await;
+            let approval = make_pending_approval(&pool, artifact, src, tgt, requester).await;
+
+            let res = approve_promotion(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(approval),
+                Json(ReviewRequest {
+                    notes: Some("ok".to_string()),
+                    skip_policy_check: false,
+                }),
+            )
+            .await;
+            assert!(res.is_ok(), "a rule-met approval must execute");
+            assert!(
+                target_has_artifact(&pool, tgt, "aok").await,
+                "a rule-met approval must copy the artifact"
+            );
+            assert_eq!(approval_status(&pool, approval).await, "approved");
+
+            cleanup(&pool, &[src, tgt], user).await;
+            cleanup_user(&pool, requester).await;
+        }
+
+        /// skip_policy_check admin break-glass still works on the approval path:
+        /// a rule-unmet promotion executes when the reviewer overrides.
+        #[tokio::test]
+        async fn test_approval_path_skip_policy_check_override() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr1940-askip-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr1940-askip-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "askip-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "askip-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "askip").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "askip").await;
+            make_rule(&pool, src, tgt, None, Some(720)).await;
+            let requester = make_requester(&pool, "askip").await;
+            let approval = make_pending_approval(&pool, artifact, src, tgt, requester).await;
+
+            let res = approve_promotion(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(approval),
+                Json(ReviewRequest {
+                    notes: None,
+                    skip_policy_check: true,
+                }),
+            )
+            .await;
+            assert!(res.is_ok(), "skip_policy_check must bypass the rule gate");
+            assert!(
+                target_has_artifact(&pool, tgt, "askip").await,
+                "break-glass approval must execute the promotion"
+            );
+            assert_eq!(approval_status(&pool, approval).await, "approved");
+
+            cleanup(&pool, &[src, tgt], user).await;
+            cleanup_user(&pool, requester).await;
+        }
+
+        // ---- separation of duties (four-eyes) on approve_promotion -----------
+
+        /// SoD: the requester of a promotion must NOT be able to approve it.
+        /// Self-approval -> 403 Authorization, no copy, approval stays pending.
+        #[tokio::test]
+        async fn test_approval_self_approval_blocked() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr-sod-self-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr-sod-self-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "sod-self-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "sod-self-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "sod-self").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "sodself").await;
+            // No rule, so only the SoD gate can block. Same principal requests
+            // AND approves.
+            let approval = make_pending_approval(&pool, artifact, src, tgt, user).await;
+
+            let res = approve_promotion(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(approval),
+                Json(ReviewRequest {
+                    notes: None,
+                    skip_policy_check: false,
+                }),
+            )
+            .await;
+            match res {
+                Err(AppError::Authorization(msg)) => assert!(
+                    msg.contains("Separation of duties"),
+                    "self-approval must be denied with an SoD message; got: {msg}"
+                ),
+                other => panic!(
+                    "expected SoD Authorization (403) block, got ok={:?}",
+                    other.is_ok()
+                ),
+            }
+            assert!(
+                !target_has_artifact(&pool, tgt, "sodself").await,
+                "a self-approved promotion must NOT copy the artifact"
+            );
+            assert_eq!(
+                approval_status(&pool, approval).await,
+                "pending",
+                "a self-approval-blocked request must remain pending"
+            );
+
+            cleanup(&pool, &[src, tgt], user).await;
+        }
+
+        /// SoD: a DISTINCT approver (different principal from the requester) may
+        /// approve, and the promotion executes.
+        #[tokio::test]
+        async fn test_approval_distinct_approver_allowed() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr-sod-ok-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr-sod-ok-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "sod-ok-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "sod-ok-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let approver = make_admin(&pool, "sod-ok").await;
+            let requester = make_requester(&pool, "sod-ok").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "sodok").await;
+            let approval = make_pending_approval(&pool, artifact, src, tgt, requester).await;
+
+            let res = approve_promotion(
+                State(state.clone()),
+                Extension(admin_ext(approver)),
+                Path(approval),
+                Json(ReviewRequest {
+                    notes: Some("second pair of eyes".to_string()),
+                    skip_policy_check: false,
+                }),
+            )
+            .await;
+            assert!(
+                res.is_ok(),
+                "a distinct approver must be able to approve the promotion"
+            );
+            assert!(
+                target_has_artifact(&pool, tgt, "sodok").await,
+                "a distinct-approver promotion must copy the artifact"
+            );
+            assert_eq!(approval_status(&pool, approval).await, "approved");
+
+            cleanup(&pool, &[src, tgt], approver).await;
+            cleanup_user(&pool, requester).await;
+        }
+
+        // ---- tenant-ownership gate on approve_promotion (xtenant) ------------
+
+        /// Cross-tenant approval: an admin-capable principal authorized only for
+        /// the corp source repo approves a promotion whose target is a globex
+        /// repo it does not own -> 403, no copy, approval stays pending.
+        #[tokio::test]
+        async fn test_approval_cross_tenant_target_blocked() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr-xta-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr-xta-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "xta-corp-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "xta-globex-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            // Tenant admin owns only the corp source, not the globex target.
+            let corp_admin = make_tenant_admin(&pool, "xta-corp").await;
+            grant_repo(&pool, corp_admin, src).await;
+            // Distinct requester so SoD is not what trips first; the tenant gate is.
+            let requester = make_requester(&pool, "xta").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "xta").await;
+            let approval = make_pending_approval(&pool, artifact, src, tgt, requester).await;
+
+            let res = approve_promotion(
+                State(state.clone()),
+                Extension(admin_ext(corp_admin)),
+                Path(approval),
+                Json(ReviewRequest {
+                    notes: None,
+                    skip_policy_check: false,
+                }),
+            )
+            .await;
+            match res {
+                Err(AppError::Authorization(msg)) => assert!(
+                    msg.contains("tenant"),
+                    "cross-tenant approval must be denied with a tenant message; got: {msg}"
+                ),
+                other => panic!(
+                    "expected tenant Authorization (403) block, got ok={:?}",
+                    other.is_ok()
+                ),
+            }
+            assert!(
+                !target_has_artifact(&pool, tgt, "xta").await,
+                "a cross-tenant approval must NOT copy the artifact"
+            );
+            assert_eq!(
+                approval_status(&pool, approval).await,
+                "pending",
+                "a tenant-blocked approval must remain pending"
+            );
+
+            cleanup(&pool, &[src, tgt], corp_admin).await;
+            cleanup_user(&pool, requester).await;
+        }
     }
 }

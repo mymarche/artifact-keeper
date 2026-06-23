@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
-    http::HeaderMap,
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
     Json, Router,
@@ -15,8 +14,9 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::extractors::RequestBaseUrl;
 use crate::api::handlers::auth::set_auth_cookies;
-use crate::api::validation::validate_outbound_url;
+use crate::api::validation::validate_outbound_sso_url;
 
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -40,14 +40,21 @@ pub fn router() -> Router<SharedState> {
         .route("/exchange", post(exchange_code))
 }
 
-/// Re-validate an OIDC endpoint URL against the shared outbound-URL SSRF
-/// guard immediately before the server fetches it as a first hop. The
-/// shared HTTP client's redirect policy only guards redirect hops, never
-/// the initial request, so each server-side fetch target (discovery,
-/// token, JWKS) is checked here. Uses the `Upstream` context, so internal
-/// IdPs are reachable when `UPSTREAM_ALLOW_PRIVATE_IPS` is set.
+/// Re-validate an OIDC endpoint URL against the outbound-URL SSRF guard
+/// immediately before the server fetches it as a first hop. The shared
+/// HTTP client's redirect policy only guards redirect hops, never the
+/// initial request, so each server-side fetch target (discovery, token,
+/// JWKS) is checked here.
+///
+/// Uses the dedicated `SsoDiscovery` context (issue #1891) so a configured,
+/// trusted IdP at a private/internal address (e.g. an in-cluster Keycloak)
+/// can be reached by setting `AK_SSRF_ALLOW_PRIVATE_CIDRS` to the IdP
+/// host/CIDR (preferred) or `SSO_ALLOW_PRIVATE_IPS=true`, without relaxing
+/// the upstream-proxy or webhook SSRF guards. Cloud-metadata, loopback and
+/// link-local targets remain hard-blocked. When blocked for a private IP,
+/// the error names the knobs so the failure is actionable.
 fn validate_oidc_fetch_url(url: &str, label: &str) -> Result<()> {
-    validate_outbound_url(url, label)
+    validate_outbound_sso_url(url, label)
 }
 
 // ---------------------------------------------------------------------------
@@ -92,7 +99,7 @@ pub async fn list_providers(
 pub async fn oidc_login(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
-    headers: HeaderMap,
+    base_url: RequestBaseUrl,
 ) -> Result<Redirect> {
     // 1. Get decrypted OIDC config
     let (row, _client_secret) = AuthConfigService::get_oidc_decrypted(&state.db, id).await?;
@@ -138,9 +145,9 @@ pub async fn oidc_login(
             AppError::Internal("OIDC discovery missing authorization_endpoint".into())
         })?;
 
-    // 4. Build redirect_uri from attribute_mapping, falling back to absolute URL
-    //    derived from request headers (X-Forwarded-Proto/Host or Host).
-    let redirect_uri = resolve_oidc_redirect_uri(&row.attribute_mapping, &id, &headers);
+    // 4. Build redirect_uri from attribute_mapping, falling back to an
+    //    externally visible absolute URL derived from the request.
+    let redirect_uri = resolve_oidc_redirect_uri(&row.attribute_mapping, &id, base_url.as_str());
 
     // 5. Build authorization URL
     let scope = if row.scopes.is_empty() {
@@ -280,7 +287,7 @@ pub async fn oidc_callback(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     Query(params): Query<OidcCallbackQuery>,
-    headers: HeaderMap,
+    base_url: RequestBaseUrl,
 ) -> Result<Response> {
     // Resolve parameter shape BEFORE hitting the session store. Empty state or
     // code is a malformed callback (400), an IdP error redirect is a 401, not a
@@ -307,7 +314,7 @@ pub async fn oidc_callback(
         auth_code,
         session.nonce,
         session.pkce_code_verifier,
-        headers,
+        base_url,
     )
     .await
 }
@@ -321,7 +328,7 @@ pub async fn oidc_callback(
 pub async fn oidc_callback_generic(
     State(state): State<SharedState>,
     Query(params): Query<OidcCallbackQuery>,
-    headers: HeaderMap,
+    base_url: RequestBaseUrl,
 ) -> Result<Response> {
     // Resolve parameter shape BEFORE hitting the session store. See
     // `resolve_oidc_callback` doc comment.
@@ -335,7 +342,7 @@ pub async fn oidc_callback_generic(
         auth_code,
         session.nonce,
         session.pkce_code_verifier,
-        headers,
+        base_url,
     )
     .await
 }
@@ -348,7 +355,7 @@ async fn oidc_callback_inner(
     authorization_code: String,
     session_nonce: Option<String>,
     pkce_code_verifier: Option<String>,
-    headers: HeaderMap,
+    base_url: RequestBaseUrl,
 ) -> Result<Response> {
     // 1. Get decrypted OIDC config
     let (row, client_secret) =
@@ -377,7 +384,8 @@ async fn oidc_callback_inner(
     validate_oidc_fetch_url(token_endpoint, "OIDC token endpoint")?;
 
     // 3. Build redirect_uri (must match the one used in the login request)
-    let redirect_uri = resolve_oidc_redirect_uri(&row.attribute_mapping, &provider_id, &headers);
+    let redirect_uri =
+        resolve_oidc_redirect_uri(&row.attribute_mapping, &provider_id, base_url.as_str());
 
     // 4. Exchange authorization code for tokens (with PKCE verifier when present).
     let mut form: Vec<(&str, &str)> = vec![
@@ -857,31 +865,25 @@ pub(crate) fn build_sso_callback_redirect(
 }
 
 /// Resolve the redirect URI from OIDC attribute_mapping, falling back to an
-/// absolute URL built from request headers.
+/// absolute URL built from the external request base URL.
 ///
 /// OIDC providers (Keycloak, Entra ID, Okta, etc.) require the redirect_uri
 /// to be an absolute URL. When no explicit value is configured in
-/// `attribute_mapping`, this function constructs one from the
-/// `X-Forwarded-Proto` / `X-Forwarded-Host` (or `Host`) request headers,
-/// which a reverse proxy typically sets. The generic callback route resolves
-/// the provider from the `state` query parameter, so the redirect URI no
-/// longer needs the provider UUID embedded in the path.
+/// `attribute_mapping`, this function constructs one from the base URL already
+/// resolved from request metadata. The generic callback route resolves the
+/// provider from the `state` query parameter, so the redirect URI no longer
+/// needs the provider UUID embedded in the path.
 pub(crate) fn resolve_oidc_redirect_uri(
     attribute_mapping: &serde_json::Value,
     _provider_id: &uuid::Uuid,
-    headers: &HeaderMap,
+    base_url: &str,
 ) -> String {
     attribute_mapping
         .get("redirect_uri")
         .and_then(|v| v.as_str())
         .map(String::from)
-        .unwrap_or_else(|| {
-            let base = request_base_url(headers);
-            format!("{}/api/v1/auth/sso/oidc/callback", base)
-        })
+        .unwrap_or_else(|| format!("{}/api/v1/auth/sso/oidc/callback", base_url))
 }
-
-use super::proxy_helpers::request_base_url;
 
 /// Resolve a claim name from OIDC attribute_mapping, returning the configured
 /// value or the provided default.
@@ -1200,6 +1202,23 @@ mod tests {
             "OIDC discovery URL"
         )
         .is_ok());
+    }
+
+    #[test]
+    fn test_validate_oidc_fetch_url_private_block_is_actionable() {
+        // Issue #1891: the private-IP block (the reported regression) must
+        // surface the operator-fixable config knobs, not an opaque error.
+        // No env mutation needed — SSO private IPs are off by default, and
+        // this asserts the message wording only.
+        let err = validate_oidc_fetch_url(
+            "https://10.10.0.8/realms/x/.well-known/openid-configuration",
+            "OIDC discovery URL",
+        )
+        .expect_err("private IdP must be blocked by default");
+        let msg = err.to_string();
+        assert!(msg.contains("private/internal network"), "msg: {msg}");
+        assert!(msg.contains("AK_SSRF_ALLOW_PRIVATE_CIDRS"), "msg: {msg}");
+        assert!(msg.contains("SSO_ALLOW_PRIVATE_IPS"), "msg: {msg}");
     }
 
     // -----------------------------------------------------------------------
@@ -1737,9 +1756,8 @@ mod tests {
             "redirect_uri": "https://app.example.com/callback"
         });
         let id = uuid::Uuid::nil();
-        let headers = HeaderMap::new();
         assert_eq!(
-            resolve_oidc_redirect_uri(&attr, &id, &headers),
+            resolve_oidc_redirect_uri(&attr, &id, "http://localhost"),
             "https://app.example.com/callback"
         );
     }
@@ -1748,9 +1766,8 @@ mod tests {
     fn test_redirect_uri_fallback_builds_absolute_url() {
         let attr = serde_json::json!({});
         let id = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
-        let headers = HeaderMap::new();
         assert_eq!(
-            resolve_oidc_redirect_uri(&attr, &id, &headers),
+            resolve_oidc_redirect_uri(&attr, &id, "http://localhost"),
             "http://localhost/api/v1/auth/sso/oidc/callback"
         );
     }
@@ -1759,9 +1776,8 @@ mod tests {
     fn test_redirect_uri_fallback_when_null() {
         let attr = serde_json::json!({ "redirect_uri": null });
         let id = uuid::Uuid::nil();
-        let headers = HeaderMap::new();
         assert_eq!(
-            resolve_oidc_redirect_uri(&attr, &id, &headers),
+            resolve_oidc_redirect_uri(&attr, &id, "http://localhost"),
             "http://localhost/api/v1/auth/sso/oidc/callback"
         );
     }
@@ -1770,9 +1786,8 @@ mod tests {
     fn test_redirect_uri_fallback_when_non_string() {
         let attr = serde_json::json!({ "redirect_uri": 42 });
         let id = uuid::Uuid::nil();
-        let headers = HeaderMap::new();
         assert_eq!(
-            resolve_oidc_redirect_uri(&attr, &id, &headers),
+            resolve_oidc_redirect_uri(&attr, &id, "http://localhost"),
             "http://localhost/api/v1/auth/sso/oidc/callback"
         );
     }
@@ -1781,77 +1796,29 @@ mod tests {
     fn test_redirect_uri_with_null_attribute_mapping() {
         let attr = serde_json::Value::Null;
         let id = uuid::Uuid::nil();
-        let headers = HeaderMap::new();
-        let uri = resolve_oidc_redirect_uri(&attr, &id, &headers);
+        let uri = resolve_oidc_redirect_uri(&attr, &id, "http://localhost");
         assert!(uri.starts_with("http"));
         assert!(uri.contains("/callback"));
     }
 
     #[test]
-    fn test_redirect_uri_with_forwarded_headers() {
+    fn test_redirect_uri_uses_supplied_base_url() {
         let attr = serde_json::json!({});
         let id = uuid::Uuid::nil();
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-proto", "https".parse().unwrap());
-        headers.insert("x-forwarded-host", "registry.example.com".parse().unwrap());
         assert_eq!(
-            resolve_oidc_redirect_uri(&attr, &id, &headers),
-            "https://registry.example.com/api/v1/auth/sso/oidc/callback"
-        );
-    }
-
-    #[test]
-    fn test_redirect_uri_with_host_header_only() {
-        let attr = serde_json::json!({});
-        let id = uuid::Uuid::nil();
-        let mut headers = HeaderMap::new();
-        headers.insert("host", "myhost:8080".parse().unwrap());
-        assert_eq!(
-            resolve_oidc_redirect_uri(&attr, &id, &headers),
-            "http://myhost:8080/api/v1/auth/sso/oidc/callback"
-        );
-    }
-
-    #[test]
-    fn test_redirect_uri_forwarded_host_takes_precedence() {
-        let attr = serde_json::json!({});
-        let id = uuid::Uuid::nil();
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-proto", "https".parse().unwrap());
-        headers.insert("x-forwarded-host", "external.example.com".parse().unwrap());
-        headers.insert("host", "internal-svc:8080".parse().unwrap());
-        assert_eq!(
-            resolve_oidc_redirect_uri(&attr, &id, &headers),
+            resolve_oidc_redirect_uri(&attr, &id, "https://external.example.com"),
             "https://external.example.com/api/v1/auth/sso/oidc/callback"
         );
     }
 
     #[test]
-    fn test_redirect_uri_host_with_embedded_scheme() {
-        let attr = serde_json::json!({});
-        let id = uuid::Uuid::nil();
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "host",
-            "https://already-absolute.example.com".parse().unwrap(),
-        );
-        assert_eq!(
-            resolve_oidc_redirect_uri(&attr, &id, &headers),
-            "https://already-absolute.example.com/api/v1/auth/sso/oidc/callback"
-        );
-    }
-
-    #[test]
-    fn test_redirect_uri_explicit_overrides_headers() {
+    fn test_redirect_uri_explicit_overrides_base_url() {
         let attr = serde_json::json!({
             "redirect_uri": "https://custom.example.com/oidc/cb"
         });
         let id = uuid::Uuid::nil();
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-proto", "https".parse().unwrap());
-        headers.insert("x-forwarded-host", "other.example.com".parse().unwrap());
         assert_eq!(
-            resolve_oidc_redirect_uri(&attr, &id, &headers),
+            resolve_oidc_redirect_uri(&attr, &id, "https://other.example.com"),
             "https://custom.example.com/oidc/cb"
         );
     }

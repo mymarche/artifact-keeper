@@ -30,11 +30,13 @@ use sqlx::{postgres::PgRow, PgPool, Row};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::api::extractors::RequestBaseUrl;
 use crate::api::handlers::proxy_helpers;
 use crate::api::SharedState;
 use crate::error::AppError;
 use crate::models::repository::RepositoryType;
 use crate::services::auth_service::AuthService;
+use crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX;
 
 // ---------------------------------------------------------------------------
 // OCI error helpers
@@ -112,8 +114,8 @@ fn auth_challenge_quoted_value(value: &str) -> String {
     escaped
 }
 
-fn www_authenticate_header(host: &str, scope: Option<&str>) -> String {
-    let realm = auth_challenge_quoted_value(&format!("{host}/v2/token"));
+fn www_authenticate_header(base_url: &str, scope: Option<&str>) -> String {
+    let realm = auth_challenge_quoted_value(&format!("{base_url}/v2/token"));
     let service = OCI_TOKEN_SERVICE;
     match scope {
         Some(s) => {
@@ -124,11 +126,11 @@ fn www_authenticate_header(host: &str, scope: Option<&str>) -> String {
     }
 }
 
-fn unauthorized_challenge(host: &str) -> Response {
-    unauthorized_challenge_with_scope(host, None)
+fn unauthorized_challenge(base_url: &str) -> Response {
+    unauthorized_challenge_with_scope(base_url, None)
 }
 
-fn unauthorized_challenge_with_scope(host: &str, scope: Option<&str>) -> Response {
+fn unauthorized_challenge_with_scope(base_url: &str, scope: Option<&str>) -> Response {
     let body = OciErrorResponse {
         errors: vec![OciErrorEntry {
             code: "UNAUTHORIZED".to_string(),
@@ -139,7 +141,7 @@ fn unauthorized_challenge_with_scope(host: &str, scope: Option<&str>) -> Respons
     let json = serde_json::to_string(&body).unwrap_or_default();
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
-        .header("WWW-Authenticate", www_authenticate_header(host, scope))
+        .header("WWW-Authenticate", www_authenticate_header(base_url, scope))
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(json))
         .unwrap()
@@ -473,10 +475,6 @@ fn push_scope(image_name: &str) -> String {
     format!("repository:{}:pull,push", image_name)
 }
 
-fn request_host(headers: &HeaderMap) -> String {
-    proxy_helpers::request_base_url(headers)
-}
-
 // ---------------------------------------------------------------------------
 // Storage helpers
 // ---------------------------------------------------------------------------
@@ -485,16 +483,18 @@ fn blob_storage_key(digest: &str) -> String {
     format!("oci-blobs/{}", digest)
 }
 
-/// Storage key prefix for OCI manifest objects.
+/// Storage key for an OCI manifest object: [`OCI_MANIFEST_STORAGE_PREFIX`]
+/// followed by the manifest digest. This is the source of truth on writes.
 ///
-/// WARNING: the `oci-manifests/` prefix is also hard-coded in the
-/// lifecycle cascade SQL (`backend/src/services/lifecycle_service.rs`,
+/// WARNING: the `oci-manifests/` prefix is also embedded as a SQL literal in
+/// the lifecycle cascade (`backend/src/services/lifecycle_service.rs`,
 /// `CASCADE_OCI_TAGS_SQL`) and in the storage GC orphan predicate
-/// (`backend/src/services/storage_gc_service.rs`). Changing this
-/// function alone will silently break both. Tracked in #1413 for
-/// extracting a shared constant.
+/// (`backend/src/services/storage_gc_service.rs`, `ORPHAN_PREDICATE_SQL`).
+/// Postgres cannot read the Rust constant, so those sites pin the literal to
+/// [`OCI_MANIFEST_STORAGE_PREFIX`] with compile-time assertions; changing the
+/// constant forces those assertions (and the SQL) to be updated in lockstep.
 fn manifest_storage_key(digest: &str) -> String {
-    format!("oci-manifests/{}", digest)
+    format!("{}{}", OCI_MANIFEST_STORAGE_PREFIX, digest)
 }
 
 fn upload_storage_key(uuid: &Uuid) -> String {
@@ -3437,7 +3437,11 @@ fn version_check_ok() -> Response {
         .unwrap()
 }
 
-async fn version_check(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+async fn version_check(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    base_url: RequestBaseUrl,
+) -> Response {
     // Accept Bearer token (standard Docker client flow)
     if validate_token(&state.db, &state.config, &headers)
         .await
@@ -3463,8 +3467,8 @@ async fn version_check(State(state): State<SharedState>, headers: HeaderMap) -> 
         }
     }
 
-    let host = request_host(&headers);
-    unauthorized_challenge(&host)
+    let base_url = base_url.as_str();
+    unauthorized_challenge(base_url)
 }
 
 // ---------------------------------------------------------------------------
@@ -3528,10 +3532,10 @@ fn canonical_blob_lookup_digest(digest: &str) -> String {
 async fn handle_head_blob(
     state: &SharedState,
     headers: &HeaderMap,
+    base_url: &str,
     image_name: &str,
     digest: &str,
 ) -> Response {
-    let host = request_host(headers);
     let scope = pull_scope(image_name);
     let is_anon = is_anonymous_token(headers);
     if !is_anon
@@ -3539,7 +3543,7 @@ async fn handle_head_blob(
             .await
             .is_err()
     {
-        return unauthorized_challenge_with_scope(&host, Some(&scope));
+        return unauthorized_challenge_with_scope(base_url, Some(&scope));
     }
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -3549,7 +3553,7 @@ async fn handle_head_blob(
 
     // Anonymous tokens may only access public repositories.
     if is_anon && !repo.is_public {
-        return unauthorized_challenge_with_scope(&host, Some(&scope));
+        return unauthorized_challenge_with_scope(base_url, Some(&scope));
     }
 
     // Check oci_blobs table. Look up by the canonical digest so an upper-case
@@ -3668,10 +3672,10 @@ async fn handle_head_blob(
 async fn handle_get_blob(
     state: &SharedState,
     headers: &HeaderMap,
+    base_url: &str,
     image_name: &str,
     digest: &str,
 ) -> Response {
-    let host = request_host(headers);
     let scope = pull_scope(image_name);
     let is_anon = is_anonymous_token(headers);
     if !is_anon
@@ -3679,7 +3683,7 @@ async fn handle_get_blob(
             .await
             .is_err()
     {
-        return unauthorized_challenge_with_scope(&host, Some(&scope));
+        return unauthorized_challenge_with_scope(base_url, Some(&scope));
     }
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -3689,7 +3693,7 @@ async fn handle_get_blob(
 
     // Anonymous tokens may only access public repositories.
     if is_anon && !repo.is_public {
-        return unauthorized_challenge_with_scope(&host, Some(&scope));
+        return unauthorized_challenge_with_scope(base_url, Some(&scope));
     }
 
     // Look up by the canonical digest so an upper-case pull still resolves a
@@ -3806,16 +3810,16 @@ async fn handle_get_blob(
 async fn handle_start_upload(
     state: &SharedState,
     headers: &HeaderMap,
+    base_url: &str,
     image_name: &str,
     query_digest: Option<&str>,
     body: Body,
 ) -> Response {
-    let host = request_host(headers);
     let scope = push_scope(image_name);
     let (claims, token_scopes) =
         match authenticate_oci_with_scopes(&state.db, &state.config, headers).await {
             Ok(c) => c,
-            Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
+            Err(_) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
         };
     // GHSA-vvc3-h39c-mrq5: a read-scoped API token must not be accepted
     // for an OCI blob upload (`docker push`). Enforce the write scope.
@@ -4119,16 +4123,16 @@ async fn handle_start_upload(
 async fn handle_patch_upload(
     state: &SharedState,
     headers: &HeaderMap,
+    base_url: &str,
     image_name: &str,
     uuid_str: &str,
     body: Body,
 ) -> Response {
-    let host = request_host(headers);
     let scope = push_scope(image_name);
     let (claims, token_scopes) =
         match authenticate_oci_with_scopes(&state.db, &state.config, headers).await {
             Ok(c) => c,
-            Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
+            Err(_) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
         };
     // GHSA-vvc3-h39c-mrq5: PATCH on an upload session is a write operation.
     if !oci_scopes_grant(&token_scopes, "write") {
@@ -4363,15 +4367,15 @@ async fn handle_patch_upload(
 async fn handle_cancel_upload(
     state: &SharedState,
     headers: &HeaderMap,
+    base_url: &str,
     image_name: &str,
     uuid_str: &str,
 ) -> Response {
-    let host = request_host(headers);
     let scope = push_scope(image_name);
     let (claims, token_scopes) =
         match authenticate_oci_with_scopes(&state.db, &state.config, headers).await {
             Ok(c) => c,
-            Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
+            Err(_) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
         };
     if !oci_scopes_grant(&token_scopes, "write") {
         return oci_forbidden_scope("write");
@@ -4581,17 +4585,17 @@ async fn handle_cancel_upload(
 async fn handle_complete_upload(
     state: &SharedState,
     headers: &HeaderMap,
+    base_url: &str,
     image_name: &str,
     uuid_str: &str,
     digest_query: Option<&str>,
     body: Body,
 ) -> Response {
-    let host = request_host(headers);
     let scope = push_scope(image_name);
     let (claims, token_scopes) =
         match authenticate_oci_with_scopes(&state.db, &state.config, headers).await {
             Ok(c) => c,
-            Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
+            Err(_) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
         };
     // GHSA-vvc3-h39c-mrq5: completing an upload session writes the blob.
     if !oci_scopes_grant(&token_scopes, "write") {
@@ -5685,10 +5689,10 @@ where
 async fn handle_head_manifest(
     state: &SharedState,
     headers: &HeaderMap,
+    base_url: &str,
     image_name: &str,
     reference: &str,
 ) -> Response {
-    let host = request_host(headers);
     let scope = pull_scope(image_name);
     let is_anon = is_anonymous_token(headers);
     if !is_anon
@@ -5696,7 +5700,7 @@ async fn handle_head_manifest(
             .await
             .is_err()
     {
-        return unauthorized_challenge_with_scope(&host, Some(&scope));
+        return unauthorized_challenge_with_scope(base_url, Some(&scope));
     }
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -5706,7 +5710,7 @@ async fn handle_head_manifest(
 
     // Anonymous tokens may only access public repositories.
     if is_anon && !repo.is_public {
-        return unauthorized_challenge_with_scope(&host, Some(&scope));
+        return unauthorized_challenge_with_scope(base_url, Some(&scope));
     }
 
     // Reference can be a tag or a digest. Resolve locally first: a surviving
@@ -5825,10 +5829,10 @@ async fn handle_head_manifest(
 async fn handle_get_manifest(
     state: &SharedState,
     headers: &HeaderMap,
+    base_url: &str,
     image_name: &str,
     reference: &str,
 ) -> Response {
-    let host = request_host(headers);
     let scope = pull_scope(image_name);
     let is_anon = is_anonymous_token(headers);
     if !is_anon
@@ -5836,7 +5840,7 @@ async fn handle_get_manifest(
             .await
             .is_err()
     {
-        return unauthorized_challenge_with_scope(&host, Some(&scope));
+        return unauthorized_challenge_with_scope(base_url, Some(&scope));
     }
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -5846,7 +5850,7 @@ async fn handle_get_manifest(
 
     // Anonymous tokens may only access public repositories.
     if is_anon && !repo.is_public {
-        return unauthorized_challenge_with_scope(&host, Some(&scope));
+        return unauthorized_challenge_with_scope(base_url, Some(&scope));
     }
 
     // Resolve locally first: a surviving tag row, or — for a digest this hosted
@@ -5972,16 +5976,16 @@ async fn handle_get_manifest(
 async fn handle_put_manifest(
     state: &SharedState,
     headers: &HeaderMap,
+    base_url: &str,
     image_name: &str,
     reference: &str,
     body: Bytes,
 ) -> Response {
-    let host = request_host(headers);
     let scope = push_scope(image_name);
     let (claims, token_scopes) =
         match authenticate_oci_with_scopes(&state.db, &state.config, headers).await {
             Ok(c) => c,
-            Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
+            Err(_) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
         };
     // GHSA-vvc3-h39c-mrq5: PUT manifest is the final step of `docker push`.
     if !oci_scopes_grant(&token_scopes, "write") {
@@ -6168,10 +6172,10 @@ async fn handle_put_manifest(
 async fn handle_tags_list(
     state: &SharedState,
     headers: &HeaderMap,
+    base_url: &str,
     image_name: &str,
     query: &std::collections::HashMap<String, String>,
 ) -> Response {
-    let host = request_host(headers);
     let scope = pull_scope(image_name);
     // #1776: mirror handle_head_manifest — anonymous tokens are allowed past the
     // auth gate so a public repository's tags can be listed without credentials.
@@ -6181,7 +6185,7 @@ async fn handle_tags_list(
             .await
             .is_err()
     {
-        return unauthorized_challenge_with_scope(&host, Some(&scope));
+        return unauthorized_challenge_with_scope(base_url, Some(&scope));
     }
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -6191,7 +6195,7 @@ async fn handle_tags_list(
 
     // Anonymous tokens may only list tags on public repositories.
     if is_anon && !repo.is_public {
-        return unauthorized_challenge_with_scope(&host, Some(&scope));
+        return unauthorized_challenge_with_scope(base_url, Some(&scope));
     }
 
     let (n, last) = match parse_pagination_params(query) {
@@ -6793,14 +6797,15 @@ async fn fetch_tags_from_remote_member(
 async fn handle_catalog(
     State(state): State<SharedState>,
     headers: HeaderMap,
+    base_url: RequestBaseUrl,
     query: Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    let host = request_host(&headers);
+    let base_url = base_url.as_str();
     if authenticate_oci(&state.db, &state.config, &headers)
         .await
         .is_err()
     {
-        return unauthorized_challenge(&host);
+        return unauthorized_challenge(base_url);
     }
 
     let (n, last) = match parse_pagination_params(&query) {
@@ -6959,15 +6964,15 @@ async fn delete_manifest_blob_refs(
 async fn handle_delete_manifest(
     state: &SharedState,
     headers: &HeaderMap,
+    base_url: &str,
     image_name: &str,
     reference: &str,
 ) -> Response {
-    let host = request_host(headers);
     let scope = push_scope(image_name);
     let (claims, token_scopes) =
         match authenticate_oci_with_scopes(&state.db, &state.config, headers).await {
             Ok(c) => c,
-            Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
+            Err(_) => return unauthorized_challenge_with_scope(base_url, Some(&scope)),
         };
     // GHSA-vvc3-h39c-mrq5: deleting a manifest is destructive. Require the
     // delete scope on API tokens. JWT/password callers pass through.
@@ -7173,6 +7178,7 @@ async fn catch_all(
     method: Method,
     uri: axum::http::Uri,
     headers: HeaderMap,
+    base_url: RequestBaseUrl,
     query: Query<std::collections::HashMap<String, String>>,
     body: Body,
 ) -> Response {
@@ -7184,6 +7190,7 @@ async fn catch_all(
     };
 
     let (image_name, operation, reference) = parsed;
+    let base_url = base_url.as_str();
 
     // Helper to require a reference, reducing repeated match arms
     macro_rules! require_ref {
@@ -7198,42 +7205,59 @@ async fn catch_all(
     match (method.as_str(), operation.as_str()) {
         ("HEAD", "blobs") => {
             let d = require_ref!(reference, "DIGEST_INVALID", "digest required");
-            handle_head_blob(&state, &headers, &image_name, &d).await
+            handle_head_blob(&state, &headers, base_url, &image_name, &d).await
         }
         ("GET", "blobs") => {
             let d = require_ref!(reference, "DIGEST_INVALID", "digest required");
-            handle_get_blob(&state, &headers, &image_name, &d).await
+            handle_get_blob(&state, &headers, base_url, &image_name, &d).await
         }
         ("POST", "uploads") => {
             let digest = query.get("digest").map(|s| s.as_str()).map(str::to_owned);
-            handle_start_upload(&state, &headers, &image_name, digest.as_deref(), body).await
+            handle_start_upload(
+                &state,
+                &headers,
+                base_url,
+                &image_name,
+                digest.as_deref(),
+                body,
+            )
+            .await
         }
         ("PATCH", "uploads") => {
             let Some(u) = reference else {
                 return missing_upload_uuid_response();
             };
-            handle_patch_upload(&state, &headers, &image_name, &u, body).await
+            handle_patch_upload(&state, &headers, base_url, &image_name, &u, body).await
         }
         ("PUT", "uploads") => {
             let Some(u) = reference else {
                 return missing_upload_uuid_response();
             };
             let digest = query.get("digest").map(|s| s.as_str()).map(str::to_owned);
-            handle_complete_upload(&state, &headers, &image_name, &u, digest.as_deref(), body).await
+            handle_complete_upload(
+                &state,
+                &headers,
+                base_url,
+                &image_name,
+                &u,
+                digest.as_deref(),
+                body,
+            )
+            .await
         }
         ("DELETE", "uploads") => {
             let Some(u) = reference else {
                 return missing_upload_uuid_response();
             };
-            handle_cancel_upload(&state, &headers, &image_name, &u).await
+            handle_cancel_upload(&state, &headers, base_url, &image_name, &u).await
         }
         ("HEAD", "manifests") => {
             let r = require_ref!(reference, "NAME_INVALID", "reference required");
-            handle_head_manifest(&state, &headers, &image_name, &r).await
+            handle_head_manifest(&state, &headers, base_url, &image_name, &r).await
         }
         ("GET", "manifests") => {
             let r = require_ref!(reference, "NAME_INVALID", "reference required");
-            handle_get_manifest(&state, &headers, &image_name, &r).await
+            handle_get_manifest(&state, &headers, base_url, &image_name, &r).await
         }
         ("PUT", "manifests") => {
             let r = require_ref!(reference, "NAME_INVALID", "reference required");
@@ -7243,13 +7267,13 @@ async fn catch_all(
                 Ok(b) => b,
                 Err(resp) => return resp,
             };
-            handle_put_manifest(&state, &headers, &image_name, &r, body).await
+            handle_put_manifest(&state, &headers, base_url, &image_name, &r, body).await
         }
         ("DELETE", "manifests") => {
             let r = require_ref!(reference, "NAME_INVALID", "reference required");
-            handle_delete_manifest(&state, &headers, &image_name, &r).await
+            handle_delete_manifest(&state, &headers, base_url, &image_name, &r).await
         }
-        ("GET", "tags") => handle_tags_list(&state, &headers, &image_name, &query).await,
+        ("GET", "tags") => handle_tags_list(&state, &headers, base_url, &image_name, &query).await,
         _ => oci_error(
             StatusCode::METHOD_NOT_ALLOWED,
             "UNSUPPORTED",
@@ -8396,71 +8420,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // request_host
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_request_host_with_host_header() {
-        let mut headers = HeaderMap::new();
-        headers.insert("host", HeaderValue::from_static("registry.example.com"));
-        assert_eq!(request_host(&headers), "http://registry.example.com");
-    }
-
-    #[test]
-    fn test_request_host_with_scheme() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "host",
-            HeaderValue::from_static("https://registry.example.com"),
-        );
-        assert_eq!(request_host(&headers), "https://registry.example.com");
-    }
-
-    #[test]
-    fn test_request_host_no_header() {
-        let headers = HeaderMap::new();
-        assert_eq!(request_host(&headers), "http://localhost");
-    }
-
-    #[test]
-    fn test_request_host_with_port() {
-        let mut headers = HeaderMap::new();
-        headers.insert("host", HeaderValue::from_static("localhost:8080"));
-        assert_eq!(request_host(&headers), "http://localhost:8080");
-    }
-
-    #[test]
-    fn test_request_host_uses_x_forwarded_proto() {
-        let mut headers = HeaderMap::new();
-        headers.insert("host", HeaderValue::from_static("registry.example.com"));
-        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-        assert_eq!(request_host(&headers), "https://registry.example.com");
-    }
-
-    #[test]
-    fn test_request_host_uses_x_forwarded_host() {
-        let mut headers = HeaderMap::new();
-        headers.insert("host", HeaderValue::from_static("backend:8080"));
-        headers.insert(
-            "x-forwarded-host",
-            HeaderValue::from_static("registry.example.com:30443"),
-        );
-        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-        assert_eq!(request_host(&headers), "https://registry.example.com:30443");
-    }
-
-    #[test]
-    fn test_request_host_forwarded_host_without_proto() {
-        let mut headers = HeaderMap::new();
-        headers.insert("host", HeaderValue::from_static("backend:8080"));
-        headers.insert(
-            "x-forwarded-host",
-            HeaderValue::from_static("registry.example.com"),
-        );
-        assert_eq!(request_host(&headers), "http://registry.example.com");
-    }
-
-    // -----------------------------------------------------------------------
     // Storage key helpers
     // -----------------------------------------------------------------------
 
@@ -9348,7 +9307,7 @@ mod tests {
     #[test]
     fn test_unauthorized_challenge_delegates_no_scope() {
         // unauthorized_challenge should produce the same result as
-        // unauthorized_challenge_with_scope(host, None)
+        // unauthorized_challenge_with_scope(base_url, None)
         let r1 = unauthorized_challenge("http://localhost");
         let r2 = unauthorized_challenge_with_scope("http://localhost", None);
         assert_eq!(r1.status(), r2.status());

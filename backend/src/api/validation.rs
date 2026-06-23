@@ -41,10 +41,11 @@ const CGNAT_SECOND_OCTET_MASK: u8 = 0xc0;
 const CGNAT_SECOND_OCTET_PREFIX: u8 = 0x40;
 
 /// Cloud-provider metadata IPs that fall outside RFC1918 / link-local.
-/// Each entry is a single-IP block. The full Alibaba CGNAT range is
-/// gated behind `BLOCK_CGNAT_OUTBOUND=true` (off by default) since
-/// `100.64.0.0/10` is also used by K8s pod CIDRs in some clusters and
-/// by CGNAT-served residential ISPs.
+/// Each entry is a single-IP block. The Alibaba metadata IP lives inside
+/// `100.64.0.0/10`; the whole CGNAT range is now blocked by default (see
+/// [`is_blocked_ipv4`]), but this single-IP entry is retained as a hard
+/// block so the metadata endpoint stays unreachable even when an operator
+/// allowlists a containing CGNAT CIDR.
 const CLOUD_METADATA_IPS: &[[u8; 4]] = &[
     [192, 0, 0, 192],     // Oracle Cloud Infrastructure
     [100, 100, 100, 200], // Alibaba Cloud
@@ -96,17 +97,28 @@ impl BlockReason {
 ///   fetches a package on behalf of a client" path.
 /// - [`OutboundUrlContext::Webhook`] reads `WEBHOOK_ALLOW_PRIVATE_IPS`.
 ///   Use for webhook delivery target URLs.
+/// - [`OutboundUrlContext::SsoDiscovery`] reads `SSO_ALLOW_PRIVATE_IPS`.
+///   Use for OIDC discovery / token / JWKS / userinfo fetches against a
+///   *configured, trusted* identity provider. Kept separate (issue #1891)
+///   so a deployment with an internal Keycloak at an RFC1918 address can
+///   reach its IdP without also relaxing the upstream-proxy or webhook
+///   SSRF guards, which take arbitrary client-influenced URLs.
 ///
 /// The named-CIDR allowlist (`AK_SSRF_ALLOW_PRIVATE_CIDRS`) is shared
-/// across both contexts because it is a positive allowlist that operators
+/// across all contexts because it is a positive allowlist that operators
 /// curate explicitly; widening it is an opt-in action, not a per-surface
-/// relaxation.
+/// relaxation. For SSO this is the preferred, narrowest knob: scope it to
+/// the IdP host/CIDR (e.g. `AK_SSRF_ALLOW_PRIVATE_CIDRS=10.10.0.8/32`)
+/// rather than enabling the blanket `SSO_ALLOW_PRIVATE_IPS` toggle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutboundUrlContext {
     /// Remote-proxy / upstream fetch path.
     Upstream,
     /// Webhook delivery target path.
     Webhook,
+    /// OIDC/SSO discovery, token, JWKS and userinfo fetch path against a
+    /// configured identity provider.
+    SsoDiscovery,
 }
 
 impl OutboundUrlContext {
@@ -116,6 +128,7 @@ impl OutboundUrlContext {
         match self {
             OutboundUrlContext::Upstream => "UPSTREAM_ALLOW_PRIVATE_IPS",
             OutboundUrlContext::Webhook => "WEBHOOK_ALLOW_PRIVATE_IPS",
+            OutboundUrlContext::SsoDiscovery => "SSO_ALLOW_PRIVATE_IPS",
         }
     }
 }
@@ -145,6 +158,43 @@ pub fn validate_outbound_url(url_str: &str, label: &str) -> Result<()> {
 /// proxy upstream URLs (and vice versa).
 pub fn validate_outbound_webhook_url(url_str: &str, label: &str) -> Result<()> {
     validate_outbound_url_with(url_str, label, OutboundUrlContext::Webhook)
+}
+
+/// Validate an OIDC/SSO endpoint URL (discovery, token, JWKS, userinfo)
+/// for a *configured, trusted* identity provider (anti-SSRF). Reads
+/// `SSO_ALLOW_PRIVATE_IPS` for the private-IP relaxation toggle, and also
+/// honors the shared `AK_SSRF_ALLOW_PRIVATE_CIDRS` allowlist.
+///
+/// Split out in issue #1891: the SSRF hardening in #1832 validated these
+/// fetches with the `Upstream` context, so an internal-Keycloak / private
+/// IdP deployment could only log in by setting `UPSTREAM_ALLOW_PRIVATE_IPS`
+/// — which also reopens the remote-proxy upstream surface to arbitrary
+/// private IPs. This dedicated context lets the configured IdP at a private
+/// address be reachable without that side effect. The metadata / loopback /
+/// link-local hard-blocks still apply (see [`is_hard_blocked_ipv4`]).
+///
+/// When a request is blocked because the target resolved to a private /
+/// internal address, the returned error names the config knobs the
+/// operator can use, so the failure is actionable instead of opaque.
+pub fn validate_outbound_sso_url(url_str: &str, label: &str) -> Result<()> {
+    match validate_outbound_url_with(url_str, label, OutboundUrlContext::SsoDiscovery) {
+        Ok(()) => Ok(()),
+        // Only the private/internal-IP block is operator-fixable via an
+        // allowlist knob; surface guidance for it. Hostname blocks (cloud
+        // metadata service names) and loopback are deliberate hard-blocks
+        // and must not advertise a bypass.
+        Err(AppError::Validation(msg)) if msg.contains("private/internal network") => {
+            Err(AppError::Validation(format!(
+                "{msg}. The identity provider resolves to a private/internal \
+                 address. If this IdP is trusted, allow it by setting \
+                 AK_SSRF_ALLOW_PRIVATE_CIDRS to the IdP host/CIDR (preferred, \
+                 e.g. AK_SSRF_ALLOW_PRIVATE_CIDRS=10.10.0.8/32) or \
+                 SSO_ALLOW_PRIVATE_IPS=true to allow all private IPs for SSO. \
+                 Cloud metadata, loopback and link-local addresses stay blocked."
+            )))
+        }
+        Err(other) => Err(other),
+    }
 }
 
 /// Validate an LDAP server URL (`ldap://` or `ldaps://`) against the SSRF
@@ -342,9 +392,11 @@ fn is_blocked_host_str(host: &str, ctx: OutboundUrlContext) -> Option<BlockReaso
 /// - IPv4 loopback / RFC1918 private / link-local / unspecified / broadcast
 /// - Specific cloud metadata IPs that fall outside RFC1918 (Oracle
 ///   `192.0.0.192`, Alibaba `100.100.100.200`)
-/// - Optionally (gated by `BLOCK_CGNAT_OUTBOUND=true`) the entire
-///   `100.64.0.0/10` CGNAT range. Off by default because K8s pod CIDRs
-///   and CGNAT-served ISPs legitimately occupy this range
+/// - RFC 6598 carrier-grade NAT `100.64.0.0/10`, blocked by default and
+///   relaxable through the same private-IP escape hatches as RFC1918
+///   (allowlist / per-context toggle). Previously this required opting in
+///   via `BLOCK_CGNAT_OUTBOUND=true`, which left a default-open SSRF hole
+///   for CGNAT targets such as Tailscale tailnet IPs
 /// - IPv6 loopback (`::1`), unspecified (`::`), link-local (`fe80::/10`),
 ///   unique-local (`fc00::/7`)
 /// - IPv4-mapped IPv6 (`::ffff:0:0/96`) and the deprecated
@@ -408,17 +460,28 @@ fn is_blocked_ipv4(v4: std::net::Ipv4Addr, ctx: OutboundUrlContext) -> bool {
     if is_hard_blocked_ipv4(v4) {
         return true;
     }
-    let octets = v4.octets();
     if v4.is_private() {
         return !private_ip_allowed(std::net::IpAddr::V4(v4), ctx);
     }
-    if cgnat_block_enabled()
-        && octets[0] == 100
-        && (octets[1] & CGNAT_SECOND_OCTET_MASK) == CGNAT_SECOND_OCTET_PREFIX
-    {
-        return true;
+    // RFC 6598 carrier-grade NAT (`100.64.0.0/10`). Treated like RFC1918:
+    // blocked by default (closes the full-response SSRF where a webhook /
+    // upstream / peer URL points at a CGNAT address such as a Tailscale
+    // tailnet IP) but relaxable through the same operator escape hatches
+    // (`AK_SSRF_ALLOW_PRIVATE_CIDRS`, the per-context blanket toggles) so
+    // a deployment whose K8s pod CIDR or CGNAT-served network legitimately
+    // lives here can opt the relevant CIDR back in.
+    if is_cgnat_ipv4(v4) {
+        return !private_ip_allowed(std::net::IpAddr::V4(v4), ctx);
     }
     false
+}
+
+/// True when `v4` is in the RFC 6598 carrier-grade NAT range
+/// `100.64.0.0/10` (first octet 100, top two bits of the second octet
+/// `0b01`).
+fn is_cgnat_ipv4(v4: std::net::Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    octets[0] == 100 && (octets[1] & CGNAT_SECOND_OCTET_MASK) == CGNAT_SECOND_OCTET_PREFIX
 }
 
 fn is_blocked_ipv6(v6: std::net::Ipv6Addr, ctx: OutboundUrlContext) -> bool {
@@ -507,6 +570,13 @@ pub fn upstream_allow_private_ips_enabled() -> bool {
 /// surface (issue #1435).
 pub fn webhook_allow_private_ips_enabled() -> bool {
     allow_private_ips_enabled(OutboundUrlContext::Webhook)
+}
+
+/// True when `SSO_ALLOW_PRIVATE_IPS` is set to a truthy value. Mirror of
+/// [`upstream_allow_private_ips_enabled`] for the OIDC/SSO discovery
+/// surface (issue #1891).
+pub fn sso_allow_private_ips_enabled() -> bool {
+    allow_private_ips_enabled(OutboundUrlContext::SsoDiscovery)
 }
 
 /// Context-aware truthy-env parse. Single source of truth for the
@@ -605,17 +675,6 @@ fn ipv6_in_prefix(net: std::net::Ipv6Addr, ip: std::net::Ipv6Addr, prefix: u8) -
     (u128::from(net) & mask) == (u128::from(ip) & mask)
 }
 
-/// Whether to block the entire `100.64.0.0/10` CGNAT range. Off by
-/// default. Operators serving artifact-keeper from a CGNAT-served
-/// network or a K8s cluster that uses CGNAT for pod CIDRs would
-/// otherwise lose the ability to fetch from those addresses. When set
-/// to `true`, every CGNAT IP is rejected as if it were RFC1918.
-fn cgnat_block_enabled() -> bool {
-    std::env::var("BLOCK_CGNAT_OUTBOUND")
-        .map(|v| matches!(v.as_str(), "1" | "true" | "True" | "TRUE"))
-        .unwrap_or(false)
-}
-
 fn record_block(label: &str, reason: &BlockReason) {
     let detail = match reason {
         BlockReason::Hostname(host) => host.clone(),
@@ -636,10 +695,10 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// Tests that mutate `BLOCK_CGNAT_OUTBOUND` must serialize to avoid
-    /// racing parallel test threads. `cargo test` runs tests in
-    /// parallel; without this lock, an env-var-mutating test can flip
-    /// state under another test's nose.
+    /// Tests that mutate process-wide env vars (the private-IP allowlist
+    /// toggles) must serialize to avoid racing parallel test threads.
+    /// `cargo test` runs tests in parallel; without this lock, an
+    /// env-var-mutating test can flip state under another test's nose.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Helper: assert that `validate_outbound_url(url, ...)` rejects with
@@ -862,56 +921,90 @@ mod tests {
         assert_blocked_ip("http://100.100.100.200/latest/meta-data");
     }
 
+    // -----------------------------------------------------------------------
+    // RFC 6598 carrier-grade NAT `100.64.0.0/10`. Blocked by default (closes
+    // the full-response SSRF where a webhook/upstream/peer URL targets a CGNAT
+    // address such as a Tailscale tailnet IP) and relaxable through the same
+    // private-IP escape hatches as RFC1918. Table-driven to keep boundary
+    // coverage without duplicated boilerplate.
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn test_alibaba_metadata_neighbor_allowed_by_default() {
-        // 100.100.100.199 is in CGNAT but not the specific Alibaba IP.
-        // With BLOCK_CGNAT_OUTBOUND off (default) it must be allowed,
-        // otherwise K8s pod CIDRs in CGNAT and homelab/CGNAT ISPs break.
-        let _guard = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var("BLOCK_CGNAT_OUTBOUND").ok();
-        std::env::remove_var("BLOCK_CGNAT_OUTBOUND");
-        let result = validate_outbound_url("http://100.100.100.199/x", "Test URL");
-        if let Some(v) = prev {
-            std::env::set_var("BLOCK_CGNAT_OUTBOUND", v);
+    fn test_cgnat_blocked_by_default() {
+        let _g = AllowlistGuard::new();
+        // In-range representatives (incl. the live finding's 100.109.36.117)
+        // and the two range edges must be blocked with the private-network
+        // message; the addresses just outside 100.64.0.0/10 must pass.
+        let blocked = [
+            "http://100.64.0.1/x",      // first usable in range
+            "http://100.109.36.117/x",  // observed Tailscale tailnet IP
+            "http://100.127.255.254/x", // near top of range
+            "http://100.64.0.0/x",      // network address (range edge)
+            "http://100.127.255.255/x", // last address of the range
+        ];
+        for url in blocked {
+            assert_blocked_ip(url);
         }
+        let allowed = [
+            "http://100.63.255.255/x", // just below the range
+            "http://100.128.0.1/x",    // just above the range
+            "http://99.255.255.255/x", // different first octet, public
+        ];
+        for url in allowed {
+            assert!(
+                validate_outbound_url(url, "Test URL").is_ok(),
+                "{url} sits outside 100.64.0.0/10 and must remain allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cgnat_blocked_across_all_contexts() {
+        // The shared validator feeds webhooks, upstream/peer fetches and SSO.
+        // A CGNAT target must be rejected on every surface by default.
+        let _g = AllowlistGuard::new();
+        let url = "http://100.109.36.117:9999/canary";
         assert!(
-            result.is_ok(),
-            "100.100.100.199 (CGNAT but not Alibaba) must be allowed by default; got {:?}",
-            result
+            validate_outbound_url(url, "Upstream URL").is_err(),
+            "CGNAT must be blocked on the upstream surface"
+        );
+        assert!(
+            validate_outbound_webhook_url(url, "Webhook URL").is_err(),
+            "CGNAT must be blocked on the webhook surface"
+        );
+        assert!(
+            validate_outbound_sso_url("https://100.109.36.117/realms/x", "OIDC discovery URL")
+                .is_err(),
+            "CGNAT must be blocked on the SSO surface"
         );
     }
 
     #[test]
-    fn test_cgnat_block_when_opted_in() {
-        // With BLOCK_CGNAT_OUTBOUND=true, the entire 100.64.0.0/10 range
-        // must be rejected. Range-boundary cases pin off-by-one bugs in
-        // the mask.
-        let _guard = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var("BLOCK_CGNAT_OUTBOUND").ok();
-        std::env::set_var("BLOCK_CGNAT_OUTBOUND", "true");
-        let low_in = validate_outbound_url("http://100.64.0.1/x", "Test URL");
-        let high_in = validate_outbound_url("http://100.127.255.254/x", "Test URL");
-        let low_out = validate_outbound_url("http://100.63.255.255/x", "Test URL");
-        let high_out = validate_outbound_url("http://100.128.0.1/x", "Test URL");
-        match prev {
-            Some(v) => std::env::set_var("BLOCK_CGNAT_OUTBOUND", v),
-            None => std::env::remove_var("BLOCK_CGNAT_OUTBOUND"),
-        }
+    fn test_cgnat_relaxed_by_named_cidr_allowlist() {
+        // An operator whose K8s pod CIDR / CGNAT-served network lives in the
+        // range can opt the specific CIDR back in via the named allowlist,
+        // and it applies to both upstream and webhook contexts.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", "100.64.0.0/16");
         assert!(
-            low_in.is_err(),
-            "100.64.0.1 must be blocked when CGNAT block is on"
+            validate_outbound_url("http://100.64.1.5/x", "Upstream URL").is_ok(),
+            "100.64.1.5 must be allowed when its CGNAT CIDR is allowlisted"
         );
         assert!(
-            high_in.is_err(),
-            "100.127.255.254 must be blocked when CGNAT block is on"
+            validate_outbound_webhook_url("http://100.64.1.5/hook", "Webhook URL").is_ok(),
+            "named allowlist must relax CGNAT on the webhook surface too"
         );
+        // A CGNAT address outside the allowlisted CIDR stays blocked.
+        assert_blocked_ip("http://100.109.36.117/x");
+    }
+
+    #[test]
+    fn test_cgnat_relaxed_by_blanket_toggle() {
+        let _g = AllowlistGuard::new();
+        std::env::set_var("UPSTREAM_ALLOW_PRIVATE_IPS", "true");
         assert!(
-            low_out.is_ok(),
-            "100.63.255.255 must remain allowed (just below CGNAT)"
-        );
-        assert!(
-            high_out.is_ok(),
-            "100.128.0.1 must remain allowed (just above CGNAT)"
+            validate_outbound_url("http://100.64.0.1/x", "Upstream URL").is_ok(),
+            "CGNAT must be allowed when UPSTREAM_ALLOW_PRIVATE_IPS=true"
         );
     }
 
@@ -1000,7 +1093,24 @@ mod tests {
 
     #[test]
     fn test_allows_k8s_service_name() {
-        assert!(validate_outbound_url("http://nexus:8081/repository/pypi", "Test URL").is_ok());
+        // A bare service name that is not in BLOCKED_HOSTS must pass the
+        // string checks. The validator additionally resolves the name and
+        // blocks it if it maps to an internal address, so this assertion is
+        // guarded: on a host whose resolver happens to map `nexus` to a
+        // blocked IP (e.g. a Tailscale/CGNAT 100.64.0.0/10 address), the
+        // *block* is the correct behaviour, not a regression in this test.
+        use std::net::ToSocketAddrs;
+        let resolves_blocked = ("nexus", 0u16)
+            .to_socket_addrs()
+            .map(|addrs| {
+                addrs
+                    .into_iter()
+                    .any(|a| is_blocked_ip_in(a.ip(), OutboundUrlContext::Upstream))
+            })
+            .unwrap_or(false);
+        if !resolves_blocked {
+            assert!(validate_outbound_url("http://nexus:8081/repository/pypi", "Test URL").is_ok());
+        }
     }
 
     #[test]
@@ -1059,6 +1169,7 @@ mod tests {
         _lock: std::sync::MutexGuard<'static, ()>,
         prev_allow: Option<String>,
         prev_webhook: Option<String>,
+        prev_sso: Option<String>,
         prev_list: Option<String>,
         prev_ssrf: Option<String>,
     }
@@ -1070,11 +1181,13 @@ mod tests {
                 _lock: lock,
                 prev_allow: std::env::var("UPSTREAM_ALLOW_PRIVATE_IPS").ok(),
                 prev_webhook: std::env::var("WEBHOOK_ALLOW_PRIVATE_IPS").ok(),
+                prev_sso: std::env::var("SSO_ALLOW_PRIVATE_IPS").ok(),
                 prev_list: std::env::var("UPSTREAM_PRIVATE_IP_ALLOWLIST").ok(),
                 prev_ssrf: std::env::var("AK_SSRF_ALLOW_PRIVATE_CIDRS").ok(),
             };
             std::env::remove_var("UPSTREAM_ALLOW_PRIVATE_IPS");
             std::env::remove_var("WEBHOOK_ALLOW_PRIVATE_IPS");
+            std::env::remove_var("SSO_ALLOW_PRIVATE_IPS");
             std::env::remove_var("UPSTREAM_PRIVATE_IP_ALLOWLIST");
             std::env::remove_var("AK_SSRF_ALLOW_PRIVATE_CIDRS");
             g
@@ -1090,6 +1203,10 @@ mod tests {
             match &self.prev_webhook {
                 Some(v) => std::env::set_var("WEBHOOK_ALLOW_PRIVATE_IPS", v),
                 None => std::env::remove_var("WEBHOOK_ALLOW_PRIVATE_IPS"),
+            }
+            match &self.prev_sso {
+                Some(v) => std::env::set_var("SSO_ALLOW_PRIVATE_IPS", v),
+                None => std::env::remove_var("SSO_ALLOW_PRIVATE_IPS"),
             }
             match &self.prev_list {
                 Some(v) => std::env::set_var("UPSTREAM_PRIVATE_IP_ALLOWLIST", v),
@@ -1600,6 +1717,180 @@ mod tests {
         assert!(webhook_allow_private_ips_enabled());
         std::env::set_var("WEBHOOK_ALLOW_PRIVATE_IPS", "maybe");
         assert!(!webhook_allow_private_ips_enabled());
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1891: dedicated SSO/OIDC discovery context. A configured,
+    // trusted IdP at a private IP must be reachable WITHOUT relaxing the
+    // upstream-proxy or webhook SSRF guards, and without unblocking
+    // metadata / loopback / link-local.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sso_blocks_private_idp_by_default() {
+        // Reproduces the regression in #1891: a private-IP IdP is blocked
+        // out of the box, with the standard private-network message.
+        let _g = AllowlistGuard::new();
+        let err = validate_outbound_sso_url(
+            "https://10.10.0.8/realms/x/.well-known/openid-configuration",
+            "OIDC discovery URL",
+        )
+        .expect_err("private IdP must be blocked by default");
+        assert!(err.to_string().contains("private/internal network"));
+    }
+
+    #[test]
+    fn test_sso_error_names_the_config_knobs() {
+        // The failure must be actionable: name the allowlist knobs so the
+        // operator is not left with an opaque VALIDATION_ERROR.
+        let _g = AllowlistGuard::new();
+        let err = validate_outbound_sso_url(
+            "https://10.10.0.8/realms/x/.well-known/openid-configuration",
+            "OIDC discovery URL",
+        )
+        .expect_err("private IdP must be blocked by default");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("AK_SSRF_ALLOW_PRIVATE_CIDRS"),
+            "error must mention the preferred CIDR knob: {msg}"
+        );
+        assert!(
+            msg.contains("SSO_ALLOW_PRIVATE_IPS"),
+            "error must mention the SSO blanket knob: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_sso_blanket_toggle_unblocks_private_idp() {
+        // SSO_ALLOW_PRIVATE_IPS=true allows the configured private IdP.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("SSO_ALLOW_PRIVATE_IPS", "true");
+        assert!(
+            validate_outbound_sso_url(
+                "https://10.10.0.8/realms/x/.well-known/openid-configuration",
+                "OIDC discovery URL",
+            )
+            .is_ok(),
+            "10.10.0.8 must be allowed for SSO when SSO_ALLOW_PRIVATE_IPS=true"
+        );
+    }
+
+    #[test]
+    fn test_sso_cidr_allowlist_scopes_to_idp_host() {
+        // Preferred narrow knob: only the IdP /32 is exempted; another
+        // private IP outside the CIDR is still blocked for SSO.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", "10.10.0.8/32");
+        assert!(
+            validate_outbound_sso_url("https://10.10.0.8/realms/x", "OIDC discovery URL").is_ok(),
+            "configured IdP /32 must be allowed via AK_SSRF_ALLOW_PRIVATE_CIDRS"
+        );
+        assert!(
+            validate_outbound_sso_url("https://10.10.0.9/realms/x", "OIDC discovery URL").is_err(),
+            "a private IP outside the allowlisted CIDR must stay blocked for SSO"
+        );
+    }
+
+    #[test]
+    fn test_sso_toggle_does_not_relax_upstream_or_webhook() {
+        // The whole point of the separate context: enabling SSO private
+        // IPs must NOT reopen the upstream-proxy or webhook SSRF surfaces.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("SSO_ALLOW_PRIVATE_IPS", "true");
+        assert!(
+            validate_outbound_url("http://10.10.0.8/upstream", "Upstream URL").is_err(),
+            "SSO toggle must not relax the upstream context"
+        );
+        assert!(
+            validate_outbound_webhook_url("http://10.10.0.8/hook", "Webhook URL").is_err(),
+            "SSO toggle must not relax the webhook context"
+        );
+    }
+
+    #[test]
+    fn test_upstream_and_webhook_toggles_do_not_relax_sso() {
+        // Inverse direction: relaxing the other surfaces must not silently
+        // open the SSO surface to arbitrary private IdPs.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("UPSTREAM_ALLOW_PRIVATE_IPS", "true");
+        std::env::set_var("WEBHOOK_ALLOW_PRIVATE_IPS", "true");
+        assert!(
+            validate_outbound_sso_url("http://10.10.0.8/realms/x", "OIDC discovery URL").is_err(),
+            "upstream/webhook toggles must not relax the SSO context"
+        );
+    }
+
+    #[test]
+    fn test_sso_toggle_still_blocks_metadata_loopback_linklocal() {
+        // Hard blocks must hold even with the blanket SSO toggle on.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("SSO_ALLOW_PRIVATE_IPS", "true");
+        assert!(
+            validate_outbound_sso_url(
+                "http://169.254.169.254/latest/meta-data",
+                "OIDC discovery URL"
+            )
+            .is_err(),
+            "AWS metadata IP must stay blocked for SSO"
+        );
+        assert!(
+            validate_outbound_sso_url("http://[::ffff:169.254.169.254]/", "OIDC discovery URL")
+                .is_err(),
+            "IPv4-mapped metadata IP must stay blocked for SSO"
+        );
+        assert!(
+            validate_outbound_sso_url("http://127.0.0.1/realms/x", "OIDC discovery URL").is_err(),
+            "loopback must stay blocked for SSO"
+        );
+        assert!(
+            validate_outbound_sso_url("http://[::1]/realms/x", "OIDC discovery URL").is_err(),
+            "IPv6 loopback must stay blocked for SSO"
+        );
+        assert!(
+            validate_outbound_sso_url("http://169.254.5.5/realms/x", "OIDC discovery URL").is_err(),
+            "link-local must stay blocked for SSO"
+        );
+    }
+
+    #[test]
+    fn test_sso_cidr_allowlist_still_blocks_metadata() {
+        // Even if an operator over-broadly allowlists a range that contains
+        // a metadata IP, the metadata hard-block fires first.
+        let _g = AllowlistGuard::new();
+        std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", "169.254.0.0/16");
+        assert!(
+            validate_outbound_sso_url(
+                "http://169.254.169.254/latest/meta-data",
+                "OIDC discovery URL"
+            )
+            .is_err(),
+            "metadata IP must stay blocked for SSO even if its range is allowlisted"
+        );
+    }
+
+    #[test]
+    fn test_sso_allows_public_idp() {
+        let _g = AllowlistGuard::new();
+        assert!(
+            validate_outbound_sso_url(
+                "https://keycloak.example.com/realms/x/.well-known/openid-configuration",
+                "OIDC discovery URL",
+            )
+            .is_ok(),
+            "public IdP must be allowed without any toggle"
+        );
+    }
+
+    #[test]
+    fn test_sso_allow_private_ips_enabled_helper() {
+        let _g = AllowlistGuard::new();
+        assert!(!sso_allow_private_ips_enabled());
+        std::env::set_var("SSO_ALLOW_PRIVATE_IPS", "true");
+        assert!(sso_allow_private_ips_enabled());
+        std::env::set_var("SSO_ALLOW_PRIVATE_IPS", "1");
+        assert!(sso_allow_private_ips_enabled());
+        std::env::set_var("SSO_ALLOW_PRIVATE_IPS", "maybe");
+        assert!(!sso_allow_private_ips_enabled());
     }
 
     // -----------------------------------------------------------------------

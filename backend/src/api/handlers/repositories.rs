@@ -730,6 +730,22 @@ pub async fn set_cache_ttl(
     let repo = service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &service).await?;
 
+    // Fine-grained permission check: non-admins need "admin" on the target
+    // repository. Cache TTL is a pull-through proxy supply-chain control on the
+    // same administrative tier as delete/update, so the tenant write gate above
+    // is not sufficient on its own.
+    if !auth.is_admin {
+        let has_perm = state
+            .permission_service
+            .check_permission(auth.user_id, "repository", repo.id, "admin", false)
+            .await?;
+        if !has_perm {
+            return Err(AppError::Authorization(
+                "Insufficient permissions to change the cache TTL of this repository".to_string(),
+            ));
+        }
+    }
+
     // Reject writes on non-remote repos before any further validation: the
     // value would never be read back by the proxy code path (see #917).
     // The explicit `repo.repo_type != RepositoryType::Remote` comparison
@@ -2166,25 +2182,27 @@ pub async fn list_artifacts(
         .get_download_stats_batch(&artifact_ids)
         .await?;
 
-    // For Maven/Gradle, also load the metadata.files arrays so we can
-    // surface POM, sources, javadoc, and other secondary files that the
-    // upload handler groups under one artifact row (#1092). Without this
-    // expansion the listing only sees the primary JAR/WAR and any
-    // secondary files appear "hidden" until a downstream remote proxy
-    // pulls them, at which point the proxy records them as their own
-    // artifact rows.
+    // Legacy Maven/Gradle uploads used to group POM, sources, javadoc, and
+    // other companion files under one artifact row in metadata.files (#1092).
+    // New uploads store each Maven asset as its own `artifacts` row, but keep
+    // this expansion so older repositories remain browsable after upgrade.
     //
-    // Note: `pagination.total` is the number of primary artifact rows,
-    // not the post-expansion item count. The items array therefore
-    // exceeds `per_page` for any page that contains a GAV with grouped
-    // secondary files. Clients that need exact page sizes should call
-    // the grouped-by-component endpoint instead (`group_by=maven_component`).
+    // Note for legacy rows: `pagination.total` is the number of artifact rows,
+    // not the post-expansion item count. The items array can therefore exceed
+    // `per_page` for a page that contains an old GAV-grouped row. Fresh Maven
+    // uploads already have one row per physical asset and do not rely on this
+    // compatibility expansion.
     let maven_files_by_artifact: std::collections::HashMap<Uuid, Vec<serde_json::Value>> =
         if is_maven_format {
             load_maven_secondary_files(&state.db, &artifact_ids).await
         } else {
             std::collections::HashMap::new()
         };
+    let listed_maven_paths: std::collections::HashSet<String> = if is_maven_format {
+        artifacts.iter().map(|a| a.path.clone()).collect()
+    } else {
+        std::collections::HashSet::new()
+    };
 
     // For npm-family repos the artifact is stored under the
     // version-segmented layout `<name>/<version>/<name>-<version>.tgz`
@@ -2209,7 +2227,12 @@ pub async fn list_artifacts(
         items.push(item);
 
         if let Some(secondary) = maven_files_by_artifact.get(&artifact_id) {
-            items.extend(expand_maven_secondary_files(&artifact, &key, secondary));
+            items.extend(expand_maven_secondary_files(
+                &artifact,
+                &key,
+                secondary,
+                &listed_maven_paths,
+            ));
         }
     }
 
@@ -2546,15 +2569,16 @@ fn expand_maven_secondary_files(
     artifact: &crate::models::artifact::Artifact,
     repo_key: &str,
     secondary: &[serde_json::Value],
+    listed_paths: &std::collections::HashSet<String>,
 ) -> Vec<ArtifactResponse> {
     let mut out = Vec::new();
     for f in secondary {
         let Some(fpath) = f.get("path").and_then(|v| v.as_str()) else {
             continue;
         };
-        if fpath == artifact.path {
-            // Skip the primary's own entry if it ever made it into the
-            // files array.
+        if fpath == artifact.path || listed_paths.contains(fpath) {
+            // Skip the primary's own entry, and skip legacy metadata entries
+            // once the same path exists as a real artifact row.
             continue;
         }
         let size = f.get("sizeBytes").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -3516,9 +3540,16 @@ pub async fn upload_artifact(
         .map(|m| m.content_type.clone())
         .unwrap_or_else(|| resolve_upload_content_type(declared_content_type, &path));
 
-    // Clean up any soft-deleted artifact at the same path so the
-    // UNIQUE(repository_id, path) constraint doesn't block re-upload.
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &path).await;
+    // No pre-cleanup here: this generic upload endpoint (and the multipart
+    // variants that delegate to it) persists through
+    // `artifact_service::upload_with_sync_options`, whose release-immutability
+    // backstop must SEE any soft-deleted tombstone at this coordinate — purging
+    // it first would hide a release-immutability swap (DELETE + re-upload of
+    // DIFFERENT bytes to a released coordinate, the exploited path). The
+    // service's `ON CONFLICT (repository_id, path) DO UPDATE ... is_deleted =
+    // false` resurrects the tombstone for the allowed cases (identical-bytes
+    // republish / mutable index files), so the UNIQUE(repository_id, path)
+    // constraint is still satisfied without the manual purge.
 
     let artifact = artifact_service
         .upload_with_sync_options(
@@ -5642,7 +5673,12 @@ mod tests {
                 "sha256": "src-sha",
             }),
         ];
-        let rows = expand_maven_secondary_files(&primary, "maven-hosted", &secondary);
+        let rows = expand_maven_secondary_files(
+            &primary,
+            "maven-hosted",
+            &secondary,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].path, "com/example/demo/1.0.0/demo-1.0.0.pom");
         assert_eq!(rows[0].content_type, "text/xml");
@@ -5665,7 +5701,28 @@ mod tests {
             "sizeBytes": 500,
             "sha256": "primary-sha",
         })];
-        let rows = expand_maven_secondary_files(&primary, "maven-hosted", &secondary);
+        let rows = expand_maven_secondary_files(
+            &primary,
+            "maven-hosted",
+            &secondary,
+            &std::collections::HashSet::new(),
+        );
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_expand_maven_secondary_files_skips_real_artifact_rows() {
+        let primary = make_artifact_for_test("com/example/demo/1.0.0/demo-1.0.0.jar");
+        let real_path = "com/example/demo/1.0.0/demo-1.0.0.pom".to_string();
+        let secondary = vec![serde_json::json!({
+            "path": real_path,
+            "extension": "pom",
+            "sizeBytes": 200,
+            "sha256": "pom-sha",
+        })];
+        let listed_paths = std::collections::HashSet::from([real_path]);
+        let rows =
+            expand_maven_secondary_files(&primary, "maven-hosted", &secondary, &listed_paths);
         assert!(rows.is_empty());
     }
 
@@ -5678,7 +5735,12 @@ mod tests {
             serde_json::json!({"extension": "pom", "sizeBytes": 100}),
             serde_json::json!({"path": "p/demo.pom", "extension": "pom"}),
         ];
-        let rows = expand_maven_secondary_files(&primary, "k", &secondary);
+        let rows = expand_maven_secondary_files(
+            &primary,
+            "k",
+            &secondary,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].path, "p/demo.pom");
     }
@@ -5687,7 +5749,12 @@ mod tests {
     fn test_expand_maven_secondary_files_handles_missing_size_and_sha() {
         let primary = make_artifact_for_test("p/demo.jar");
         let secondary = vec![serde_json::json!({"path": "p/demo.pom", "extension": "pom"})];
-        let rows = expand_maven_secondary_files(&primary, "k", &secondary);
+        let rows = expand_maven_secondary_files(
+            &primary,
+            "k",
+            &secondary,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(rows[0].size_bytes, 0);
         assert_eq!(rows[0].checksum_sha256, "");
     }
@@ -8011,6 +8078,178 @@ mod tests {
         tdh::cleanup(&pool, repo_id, user_id).await;
     }
 
+    // -----------------------------------------------------------------------
+    // Release-immutability swap via DELETE + re-upload (the exploited endpoint).
+    //
+    // These drive the SAME `upload_artifact` / `delete_artifact` handlers the
+    // generic repo-scoped `/repositories/{key}/artifacts/*path` route maps to —
+    // the endpoint the red-team reproduction hits and which earlier fixes never
+    // wired to the guard. DB-backed; skip cleanly when DATABASE_URL is unset.
+    // -----------------------------------------------------------------------
+
+    /// Upload a versioned artifact, DELETE it, then PUT DIFFERENT bytes to the
+    /// same coordinate -> the re-upload MUST be rejected (409 Conflict). Covers
+    /// a default-format (Generic) repo, proving the oracle protects coordinates
+    /// the proxy-cache classifier alone treats as mutable.
+    #[tokio::test]
+    async fn delete_then_reupload_different_bytes_blocked_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let auth = Some(tdh::make_auth(user_id, &username));
+        // {package}/{version}/{filename} -> a versioned release coordinate.
+        let path = "app/1.0.0/app-1.0.0.bin".to_string();
+
+        // 1) Initial publish.
+        let up = upload_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+            Bytes::from_static(b"ORIGINAL-RELEASE-BYTES"),
+        )
+        .await;
+        assert!(up.is_ok(), "initial publish must succeed: {up:?}");
+
+        // 2) DELETE (soft-delete -> tombstone). Generic classifies mutable, so
+        // the delete guard permits this even for a non-admin.
+        let del = delete_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(del.is_ok(), "delete of the release must succeed: {del:?}");
+
+        // 3) Re-upload DIFFERENT bytes to the same coordinate -> the swap. MUST
+        // be blocked by the release-immutability backstop.
+        let swap = upload_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+            Bytes::from_static(b"SWAPPED-MALICIOUS-BYTES"),
+        )
+        .await;
+        assert!(
+            matches!(swap, Err(AppError::Conflict(_))),
+            "DELETE + re-upload of DIFFERENT bytes to a released coordinate must 409, got: {swap:?}"
+        );
+
+        // The stored content must remain the ORIGINAL (no swap occurred).
+        let remaining = sqlx::query_scalar::<_, String>(
+            "SELECT checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        let original_sha = ArtifactService::calculate_sha256(b"ORIGINAL-RELEASE-BYTES");
+        assert_eq!(
+            remaining.as_deref(),
+            Some(original_sha.as_str()),
+            "the released content must be unchanged after a blocked swap"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Legit flow: re-uploading the IDENTICAL bytes after a DELETE is allowed
+    /// (idempotent retract + republish), and re-uploading DIFFERENT bytes to a
+    /// genuinely MUTABLE index path (a Maven `maven-metadata.xml`) is allowed.
+    #[tokio::test]
+    async fn delete_then_reupload_legit_flows_allowed_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "maven").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        // Admin auth so the delete guard permits deleting an immutable Maven jar.
+        let mut admin = tdh::make_auth(user_id, &username);
+        admin.is_admin = true;
+        let auth = Some(admin);
+
+        // (a) Identical-bytes retract + republish of an immutable coordinate.
+        let path = "com/x/app/1.0.0/app-1.0.0.jar".to_string();
+        let body = Bytes::from_static(b"SAME-RELEASE-CONTENT");
+        upload_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+            body.clone(),
+        )
+        .await
+        .expect("publish jar");
+        delete_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("admin delete jar");
+        let republish = upload_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+            body.clone(),
+        )
+        .await;
+        assert!(
+            republish.is_ok(),
+            "identical-bytes republish after delete must be allowed: {republish:?}"
+        );
+
+        // (b) Different-bytes re-upload to a MUTABLE index path is allowed.
+        let meta = "com/x/app/maven-metadata.xml".to_string();
+        upload_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), meta.clone())),
+            HeaderMap::new(),
+            Bytes::from_static(b"<metadata>v1</metadata>"),
+        )
+        .await
+        .expect("publish metadata");
+        delete_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), meta.clone())),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("delete metadata");
+        let rewrite = upload_artifact(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((key.clone(), meta.clone())),
+            HeaderMap::new(),
+            Bytes::from_static(b"<metadata>v2-updated</metadata>"),
+        )
+        .await;
+        assert!(
+            rewrite.is_ok(),
+            "rewriting a mutable maven-metadata.xml after delete must be allowed: {rewrite:?}"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// DB-backed sibling for the read/visibility gate: a non-member gets NotFound
     /// on a private repo; a granted member sees it. Skips with no DATABASE_URL.
     #[tokio::test]
@@ -8111,6 +8350,103 @@ mod tests {
             .bind(user_id)
             .execute(&pool)
             .await;
+    }
+
+    /// DB-backed: a non-admin member that holds write access (developer role)
+    /// on a Remote repo but NO `repository:admin` grant is DENIED on
+    /// `set_cache_ttl` (the pull-through proxy cache-TTL is an administrative
+    /// supply-chain control, same tier as delete/update). Granting
+    /// `repository:admin` lets the same user through, and a global admin is
+    /// always allowed. Skips when no `DATABASE_URL` is configured.
+    #[tokio::test]
+    async fn set_cache_ttl_requires_repo_admin_grant_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        // Remote repo: the only repo_type set_cache_ttl accepts writes on.
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        // Grant developer (write) access so the user passes require_repo_write_access.
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let ext = tdh::make_auth(user_id, &username);
+        let req = || SetCacheTtlRequest {
+            cache_ttl_seconds: 1,
+        };
+
+        // Deny: write access alone is not enough without repository:admin.
+        let denied = set_cache_ttl(
+            State(state.clone()),
+            Extension(Some(ext.clone())),
+            Path(key.clone()),
+            Json(req()),
+        )
+        .await;
+        match denied {
+            Err(AppError::Authorization(msg)) => {
+                assert!(
+                    msg.contains("Insufficient permissions"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => {
+                panic!("expected Authorization denial without repository:admin, got: {other:?}")
+            }
+        }
+
+        // Allow: grant the user repository:admin on this repo. A fresh state
+        // avoids the per-process permission cache from the deny lookup above.
+        sqlx::query(
+            "INSERT INTO permissions (principal_type, principal_id, target_type, target_id, actions) \
+             VALUES ('user', $1, 'repository', $2, ARRAY['admin'])",
+        )
+        .bind(user_id)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("grant repository:admin");
+        let state2 = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let allowed = set_cache_ttl(
+            State(state2),
+            Extension(Some(ext.clone())),
+            Path(key.clone()),
+            Json(req()),
+        )
+        .await;
+        assert!(
+            allowed.is_ok(),
+            "non-admin WITH repository:admin must be allowed: {allowed:?}"
+        );
+
+        // Allow: a global admin is always allowed (is_admin short-circuit).
+        let admin_ext = AuthExtension {
+            is_admin: true,
+            ..tdh::make_auth(user_id, &username)
+        };
+        let state3 = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let admin_ok = set_cache_ttl(
+            State(state3),
+            Extension(Some(admin_ext)),
+            Path(key.clone()),
+            Json(req()),
+        )
+        .await;
+        assert!(
+            admin_ok.is_ok(),
+            "global admin must be allowed: {admin_ok:?}"
+        );
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM permissions WHERE principal_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
     }
 
     /// Issue #913 binding test:

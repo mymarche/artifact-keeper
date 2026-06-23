@@ -19,7 +19,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::path::Path;
 use tracing::info;
 
@@ -28,8 +28,8 @@ use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, RawPackage, Severity};
 use crate::services::scanner_service::{
     cached_cli_version, capture_cli_version, fail_scan, format_grype_version,
-    is_oci_image_artifact, join_oci_image_ref, parse_oci_manifest_path, validate_trivy_purl,
-    ScanOutput, ScanTarget, ScanWorkspace, Scanner, VersionCache,
+    is_oci_image_artifact, join_oci_image_ref, parse_oci_manifest_path, resolve_scan_reference,
+    validate_trivy_purl, ScanOutput, ScanTarget, ScanWorkspace, Scanner, VersionCache,
 };
 
 // ---------------------------------------------------------------------------
@@ -115,16 +115,63 @@ pub struct GrypeArtifact {
     pub licenses: Option<Vec<GrypeLicense>>,
 }
 
-/// Per-license entry inside `artifact.licenses`. Grype emits objects of
-/// the shape `{"value": "MIT", "spdxExpression": "MIT", "type": "declared"}`.
-/// We only need the `value` (or `spdxExpression` when present) — the rest
-/// is informational.
-#[derive(Debug, Deserialize)]
+/// Per-license entry inside `artifact.licenses`.
+///
+/// Grype serializes this array heterogeneously: an entry is either an object
+/// `{"value": "MIT", "spdxExpression": "MIT", "type": "declared"}` or a bare
+/// string holding the raw declared license — which may be an SPDX id (`"BSD"`)
+/// or even a URL. For example `grype log4j-core-2.14.1.jar -o json` (grype
+/// v0.114.0 / syft v1.45.1) emits
+/// `"licenses": ["https://www.apache.org/licenses/LICENSE-2.0.txt"]`.
+///
+/// A struct-only `derive(Deserialize)` rejects the string form with
+/// `invalid type: string "...", expected struct GrypeLicense`, and because
+/// `licenses` is nested inside the report that aborts the *entire* parse — one
+/// string-shaped license turns an otherwise successful scan into a hard
+/// failure. The deserializer below accepts both shapes. Only
+/// `value`/`spdxExpression` are consumed downstream; the rest is informational.
+#[derive(Debug)]
 pub struct GrypeLicense {
-    #[serde(default)]
     pub value: Option<String>,
-    #[serde(default, rename = "spdxExpression")]
     pub spdx_expression: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for GrypeLicense {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Accept either the bare-string or the object form. `untagged` tries
+        // the variants in order, so a string matches `Str` and an object falls
+        // through to `Obj`.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            /// Bare string: the raw declared license (an SPDX id or a URL).
+            Str(String),
+            /// Structured form: `{"value": "MIT", "spdxExpression": "MIT"}`.
+            Obj {
+                #[serde(default)]
+                value: Option<String>,
+                #[serde(default, rename = "spdxExpression")]
+                spdx_expression: Option<String>,
+            },
+        }
+
+        Ok(match Raw::deserialize(deserializer)? {
+            Raw::Str(value) => GrypeLicense {
+                value: Some(value),
+                spdx_expression: None,
+            },
+            Raw::Obj {
+                value,
+                spdx_expression,
+            } => GrypeLicense {
+                value,
+                spdx_expression,
+            },
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -194,7 +241,10 @@ fn classify_grype_spawn_error(err: &std::io::Error) -> AppError {
 ///
 /// The returned value has any scheme (`https://`, `http://`) stripped and
 /// trailing `/` trimmed, because Grype expects `host[:port]`, not a URL.
-fn resolve_registry_host() -> String {
+///
+/// `pub(crate)` so `ImageScanner::extract_image_ref_for_repo` reuses the same
+/// host-resolution logic when qualifying the Trivy scan target.
+pub(crate) fn resolve_registry_host() -> String {
     let raw = std::env::var("AK_GRYPE_REGISTRY_HOST")
         .ok()
         .filter(|s| !s.is_empty())
@@ -253,11 +303,22 @@ impl GrypeScanner {
     /// `v2/<name>/manifests/<ref>` path; the caller skips Grype rather than
     /// falling through to dir mode (which would resurrect #966's zero-
     /// findings-on-manifest-JSON bug).
-    pub(crate) fn build_registry_image_ref(artifact: &Artifact) -> Option<String> {
+    /// `body` is the in-hand manifest body for the artifact (the orchestrator
+    /// loads it and threads it through `scan`). For a multi-arch image index it
+    /// is used to resolve a concrete scannable child-platform digest before the
+    /// host/name qualification and join (#1971); for single-arch / malformed /
+    /// absent bodies the reference is unchanged (passthrough). Applicability
+    /// gates have no body at gate time and pass `None`, which resolves to
+    /// passthrough — gating stays on the PATH only, never on the index body.
+    pub(crate) fn build_registry_image_ref(
+        artifact: &Artifact,
+        body: Option<&[u8]>,
+    ) -> Option<String> {
         let (name, reference) = parse_oci_manifest_path(&artifact.path)?;
+        let resolved = resolve_scan_reference(body.unwrap_or_default(), reference).into_reference();
         let host = resolve_registry_host();
         let qualified_name = format!("{}/{}", host, name);
-        Some(join_oci_image_ref(&qualified_name, reference))
+        Some(join_oci_image_ref(&qualified_name, &resolved))
     }
 
     /// Build the Grype registry image ref using the owning repository routing
@@ -274,11 +335,44 @@ impl GrypeScanner {
         artifact: &Artifact,
         repository_key: &str,
         _repository_type: &str,
+        body: Option<&[u8]>,
     ) -> Option<String> {
         let (name, reference) = parse_oci_manifest_path(&artifact.path)?;
+        let resolved = resolve_scan_reference(body.unwrap_or_default(), reference).into_reference();
         let host = resolve_registry_host();
         let qualified_name = format!("{}/{}/{}", host, repository_key, name);
-        Some(join_oci_image_ref(&qualified_name, reference))
+        Some(join_oci_image_ref(&qualified_name, &resolved))
+    }
+
+    /// Single source of truth for the OCI `registry:` image ref used by the
+    /// production scan dispatch (`is_applicable_for_target` and
+    /// `scan_target`).
+    ///
+    /// This intentionally delegates to the **repository-scoped** builder, not
+    /// the legacy path-only `build_registry_image_ref`. Stored OCI artifact
+    /// paths omit the routing key (`v2/<image>/manifests/<ref>`), but the
+    /// external `/v2/` route that Grype pulls from is
+    /// `/v2/<repo_key>/<image>/manifests/<ref>` (see `oci_v2::resolve_repo`,
+    /// which splits the first path segment as the repository key). Issue #1903:
+    /// dispatching through the path-only builder produced
+    /// `<host>/<image>:<tag>`, which Grype resolved to `/v2/<image>/manifests/...`
+    /// and the registry rejected with `NAME_UNKNOWN` because no repository
+    /// named `<image>` exists. Threading the owning repository key restores a
+    /// routable `<host>/<repo_key>/<image>:<tag>` ref.
+    ///
+    /// `body` is the in-hand manifest body used for index→child resolution
+    /// (#1971); applicability gating passes `None` so it stays path-only.
+    fn oci_registry_target(
+        artifact: &Artifact,
+        target: &ScanTarget<'_>,
+        body: Option<&[u8]>,
+    ) -> Option<String> {
+        Self::build_registry_image_ref_for_repo(
+            artifact,
+            target.repository_key,
+            target.repository_type,
+            body,
+        )
     }
 
     async fn scan_oci_registry_ref(
@@ -654,7 +748,11 @@ impl Scanner for GrypeScanner {
             // registry mode has nothing to pull, and falling through to dir
             // mode would resurrect the #966 "0 findings on manifest JSON"
             // bug. Better to skip Grype for malformed OCI paths.
-            return Self::build_registry_image_ref(artifact).is_some();
+            // Applicability gates on the PATH only: there is no manifest body
+            // at gate time, so pass None (→ passthrough). A malformed index
+            // body must never flip an artifact applicable→not-applicable and
+            // skip the scan (#1971).
+            return Self::build_registry_image_ref(artifact, None).is_some();
         }
         true
     }
@@ -665,12 +763,8 @@ impl Scanner for GrypeScanner {
             // Production OCI applicability is repository-aware: stored
             // artifact paths omit the routing key, so Grype must validate that
             // a ref can be built with the owning repository key restored.
-            return Self::build_registry_image_ref_for_repo(
-                artifact,
-                target.repository_key,
-                target.repository_type,
-            )
-            .is_some();
+            // Path-only applicability: no manifest body at gate time (#1971).
+            return Self::oci_registry_target(artifact, target, None).is_some();
         }
         self.is_applicable(artifact)
     }
@@ -703,13 +797,18 @@ impl Scanner for GrypeScanner {
         // regression). `is_applicable` already filtered out OCI paths Grype
         // cannot build a ref for.
         if is_oci_image_artifact(artifact) {
-            let image_ref = Self::build_registry_image_ref(artifact).ok_or_else(|| {
-                AppError::Internal(
-                    "Grype OCI scan: failed to reconstruct registry image ref \
+            // #1971: pass the in-hand manifest body so a multi-arch image index
+            // is resolved to a concrete scannable child digest before grype
+            // sees it (otherwise grype's default platform pick can catalog zero
+            // packages → empty SBOM).
+            let image_ref =
+                Self::build_registry_image_ref(artifact, Some(content)).ok_or_else(|| {
+                    AppError::Internal(
+                        "Grype OCI scan: failed to reconstruct registry image ref \
                      (is_applicable should have rejected this artifact)"
-                        .to_string(),
-                )
-            })?;
+                            .to_string(),
+                    )
+                })?;
             return self.scan_oci_registry_ref(artifact, image_ref).await;
         }
 
@@ -763,18 +862,15 @@ impl Scanner for GrypeScanner {
     ) -> Result<ScanOutput> {
         let artifact = target.artifact;
         if is_oci_image_artifact(artifact) {
-            let image_ref = Self::build_registry_image_ref_for_repo(
-                artifact,
-                target.repository_key,
-                target.repository_type,
-            )
-            .ok_or_else(|| {
-                AppError::Internal(
-                    "Grype OCI scan: failed to reconstruct repository-qualified registry image ref \
+            // #1971: thread the in-hand manifest body for index→child resolution.
+            let image_ref =
+                Self::oci_registry_target(artifact, target, Some(content)).ok_or_else(|| {
+                    AppError::Internal(
+                        "Grype OCI scan: failed to reconstruct repository-qualified registry image ref \
                      (is_applicable_for_target should have rejected this artifact)"
-                        .to_string(),
-                )
-            })?;
+                            .to_string(),
+                    )
+                })?;
             return self.scan_oci_registry_ref(artifact, image_ref).await;
         }
 
@@ -907,7 +1003,7 @@ mod tests {
             "application/vnd.oci.image.manifest.v1+json",
             "v2/library/nginx/manifests/latest",
         );
-        let r = GrypeScanner::build_registry_image_ref_for_repo(&a, "docker-local", "local")
+        let r = GrypeScanner::build_registry_image_ref_for_repo(&a, "docker-local", "local", None)
             .expect("ref must build");
         assert_eq!(r, "localhost:8080/docker-local/library/nginx:latest");
     }
@@ -920,7 +1016,7 @@ mod tests {
             "application/vnd.oci.image.manifest.v1+json",
             "v2/library/nginx/manifests/latest",
         );
-        let r = GrypeScanner::build_registry_image_ref(&a).expect("ref must build");
+        let r = GrypeScanner::build_registry_image_ref(&a, None).expect("ref must build");
         assert_eq!(
             r, "localhost:8080/library/nginx:latest",
             "legacy callers without ScanTarget context still get the old path-only ref; production uses build_registry_image_ref_for_repo"
@@ -941,7 +1037,7 @@ mod tests {
             "application/vnd.oci.image.manifest.v1+json",
             "v2/org/app/manifests/sha256:cf4501fe4ed427dfc7c81f68be661271ffd164bb2e774caf0e3aa8eac775eb6b",
         );
-        let r = GrypeScanner::build_registry_image_ref_for_repo(&a, "oci-prod", "local")
+        let r = GrypeScanner::build_registry_image_ref_for_repo(&a, "oci-prod", "local", None)
             .expect("ref must build");
         assert_eq!(
             r,
@@ -967,7 +1063,7 @@ mod tests {
             "application/vnd.oci.image.manifest.v1+json",
             "v2/library/redis/manifests/7.2",
         );
-        let r = GrypeScanner::build_registry_image_ref_for_repo(&a, "docker-local", "local")
+        let r = GrypeScanner::build_registry_image_ref_for_repo(&a, "docker-local", "local", None)
             .expect("ref must build");
         // Scheme stripped, trailing slashes trimmed.
         assert_eq!(
@@ -985,8 +1081,9 @@ mod tests {
             "application/vnd.docker.distribution.manifest.v2+json",
             "v2/library/alpine/manifests/3.19",
         );
-        let r = GrypeScanner::build_registry_image_ref_for_repo(&a, "docker-mirror", "remote")
-            .expect("ref must build");
+        let r =
+            GrypeScanner::build_registry_image_ref_for_repo(&a, "docker-mirror", "remote", None)
+                .expect("ref must build");
         assert_eq!(
             r,
             "ak.svc.cluster.local:8080/docker-mirror/library/alpine:3.19"
@@ -1009,7 +1106,7 @@ mod tests {
             "application/vnd.oci.image.manifest.v1+json",
             "v2/library/nginx/manifests/latest",
         );
-        let r = GrypeScanner::build_registry_image_ref_for_repo(&a, "docker-local", "local")
+        let r = GrypeScanner::build_registry_image_ref_for_repo(&a, "docker-local", "local", None)
             .expect("ref must build");
         assert!(
             !r.contains("hunter2") && !r.contains("svcuser"),
@@ -1035,7 +1132,7 @@ mod tests {
             "stored OCI artifact paths are repository-internal and intentionally omit the repo key"
         );
 
-        let r = GrypeScanner::build_registry_image_ref_for_repo(&a, "docker-local", "local")
+        let r = GrypeScanner::build_registry_image_ref_for_repo(&a, "docker-local", "local", None)
             .expect("ref must build");
         assert_eq!(r, "localhost:8080/docker-local/library/nginx:latest");
     }
@@ -1048,7 +1145,7 @@ mod tests {
             "application/vnd.docker.distribution.manifest.v2+json",
             "v2/library/alpine/manifests/3.19",
         );
-        let r = GrypeScanner::build_registry_image_ref_for_repo(&a, "docker-cache", "remote")
+        let r = GrypeScanner::build_registry_image_ref_for_repo(&a, "docker-cache", "remote", None)
             .expect("ref must build");
         assert_eq!(r, "localhost:8080/docker-cache/library/alpine:3.19");
     }
@@ -1061,7 +1158,7 @@ mod tests {
             "application/vnd.oci.image.manifest.v1+json",
             "v2/library/nginx/manifests/latest",
         );
-        let r = GrypeScanner::build_registry_image_ref_for_repo(&a, "library", "local")
+        let r = GrypeScanner::build_registry_image_ref_for_repo(&a, "library", "local", None)
             .expect("ref must build");
         assert_eq!(r, "localhost:8080/library/library/nginx:latest");
     }
@@ -1077,12 +1174,166 @@ mod tests {
         ] {
             let a = make_test_artifact("x", "application/octet-stream", path);
             assert!(
-                GrypeScanner::build_registry_image_ref_for_repo(&a, "docker-local", "local")
+                GrypeScanner::build_registry_image_ref_for_repo(&a, "docker-local", "local", None)
                     .is_none(),
                 "malformed path '{}' must not produce a registry ref",
                 path
             );
         }
+    }
+
+    /// #1971 builder integration: when an image-index body is threaded into
+    /// the repo-scoped builder, the ref it produces addresses a concrete child
+    /// digest (host/repo/name@sha256:<child>), not the index tag — so grype
+    /// enumerates a real image instead of falling back to an empty default
+    /// platform pick.
+    #[test]
+    fn test_build_registry_image_ref_for_repo_resolves_index_to_child_digest() {
+        let _env = EnvGuard::new();
+        let child = match crate::services::scanner_service::runner_arch() {
+            "arm64" => "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            _ => "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        };
+        let index_body = r#"{"manifests":[
+                 {"digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","platform":{"os":"linux","architecture":"amd64"}},
+                 {"digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","platform":{"os":"linux","architecture":"arm64"}}
+               ]}"#;
+        let a = make_test_artifact(
+            "app",
+            "application/vnd.oci.image.index.v1+json",
+            "v2/org/app/manifests/latest",
+        );
+        let r = GrypeScanner::build_registry_image_ref_for_repo(
+            &a,
+            "oci-prod",
+            "local",
+            Some(index_body.as_bytes()),
+        )
+        .expect("ref must build");
+        assert_eq!(r, format!("localhost:8080/oci-prod/org/app@{}", child));
+        assert!(
+            !r.ends_with(":latest"),
+            "index ref must be resolved to a child digest, not the index tag: {r}"
+        );
+    }
+
+    /// #1971 regression: a single-arch image body threaded into the builder
+    /// leaves the tag ref unchanged (passthrough) — identical to the no-body
+    /// path the existing tests assert.
+    #[test]
+    fn test_build_registry_image_ref_for_repo_single_arch_body_is_unchanged() {
+        let _env = EnvGuard::new();
+        let single_arch = br#"{"schemaVersion":2,"config":{"digest":"sha256:cfg"},"layers":[]}"#;
+        let a = make_test_artifact(
+            "nginx",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/library/nginx/manifests/latest",
+        );
+        let with_body = GrypeScanner::build_registry_image_ref_for_repo(
+            &a,
+            "docker-local",
+            "local",
+            Some(single_arch),
+        )
+        .expect("ref must build");
+        let without_body =
+            GrypeScanner::build_registry_image_ref_for_repo(&a, "docker-local", "local", None)
+                .expect("ref must build");
+        assert_eq!(
+            with_body,
+            "localhost:8080/docker-local/library/nginx:latest"
+        );
+        assert_eq!(
+            with_body, without_body,
+            "single-arch body must be byte-for-byte identical to the no-body path"
+        );
+    }
+
+    /// Regression test for issue #1903 ("Cannot run Grype OCI scan on images
+    /// in docker repo" / `NAME_UNKNOWN`).
+    ///
+    /// The production scan dispatch (`scan_target` / `is_applicable_for_target`)
+    /// must build the OCI `registry:` ref through the repository-scoped
+    /// builder so the ref carries the owning repository key. The exact #1903
+    /// scenario: an image pushed to docker repo `docker-repo1` is stored at
+    /// `v2/sa-backend/manifests/release-1.4.0` (the routing key is stripped on
+    /// store). Grype must be pointed at `/v2/docker-repo1/sa-backend/...`
+    /// (host/`<repo_key>`/`<image>`:`<tag>`), because `oci_v2::resolve_repo`
+    /// splits the first path segment as the repository key. With the bug, the
+    /// path-only ref `<host>/sa-backend:release-1.4.0` made Grype request
+    /// `/v2/sa-backend/manifests/...`, which the registry rejected with
+    /// `NAME_UNKNOWN: repository not found: sa-backend`.
+    #[test]
+    fn test_scan_dispatch_uses_repo_scoped_ref_for_docker_repo_issue_1903() {
+        let _env = EnvGuard::new();
+        let artifact = make_test_artifact(
+            "sa-backend",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/sa-backend/manifests/release-1.4.0",
+        );
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "docker-repo1",
+            repository_type: "local",
+        };
+
+        // The scan dispatch resolves a routable, repository-scoped ref.
+        let dispatched =
+            GrypeScanner::oci_registry_target(&artifact, &target, None).expect("ref must build");
+        assert_eq!(
+            dispatched, "localhost:8080/docker-repo1/sa-backend:release-1.4.0",
+            "scan dispatch must thread the owning repository key into the OCI ref"
+        );
+
+        // Guard: the ref Grype receives must contain the repo key and must NOT
+        // be the path-only form that triggered NAME_UNKNOWN in #1903.
+        assert!(
+            dispatched.contains("/docker-repo1/sa-backend:"),
+            "dispatched ref must be repo-scoped (<repo>/<image>): {dispatched}"
+        );
+        let path_only = GrypeScanner::build_registry_image_ref(&artifact, None)
+            .expect("legacy builder also resolves the path");
+        assert_eq!(
+            path_only, "localhost:8080/sa-backend:release-1.4.0",
+            "sanity: the legacy path-only builder is exactly the broken #1903 ref"
+        );
+        assert_ne!(
+            dispatched, path_only,
+            "scan dispatch must NOT fall back to the path-only ref that caused #1903"
+        );
+    }
+
+    /// Companion to the dispatch test: applicability for a docker-repo OCI
+    /// artifact is also computed via the repository-scoped builder, so an
+    /// applicable artifact never gets routed to a non-routable scan.
+    #[test]
+    fn test_is_applicable_for_target_oci_docker_repo_is_repo_scoped_issue_1903() {
+        let _env = EnvGuard::new();
+        let artifact = make_test_artifact(
+            "sa-backend",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/sa-backend/manifests/release-1.4.0",
+        );
+        let target = ScanTarget {
+            artifact: &artifact,
+            repository_key: "docker-repo1",
+            repository_type: "local",
+        };
+        assert!(
+            grype().is_applicable_for_target(&target),
+            "an OCI image in a docker repo must be applicable for Grype registry scanning"
+        );
+        // And the ref applicability validated is the repo-scoped one.
+        assert_eq!(
+            GrypeScanner::oci_registry_target(&artifact, &target, None),
+            GrypeScanner::build_registry_image_ref_for_repo(
+                &artifact,
+                "docker-repo1",
+                "local",
+                None
+            ),
+            "applicability and dispatch must agree on the repo-scoped ref"
+        );
     }
 
     #[test]
@@ -2075,5 +2326,53 @@ mod tests {
             Some("Apache-2.0"),
             "valid SPDX licenses must pass through the sanitizer unchanged"
         );
+    }
+
+    /// Regression: Grype emits `artifact.licenses` entries as either an object
+    /// or a bare string (an SPDX id or a URL). The struct-only deserialize
+    /// aborted the whole report parse on the first string-shaped license
+    /// (`invalid type: string "...", expected struct GrypeLicense`), turning a
+    /// successful scan into a hard failure. The string below is the literal
+    /// value `grype log4j-core-2.14.1.jar -o json` (v0.114.0) produced. Both
+    /// shapes — and a mix of the two in one array — must parse.
+    #[test]
+    fn test_grype_license_accepts_bare_string_and_object() {
+        let json = r#"{
+            "matches": [{
+                "vulnerability": {
+                    "id": "CVE-2024-0001",
+                    "severity": "High"
+                },
+                "artifact": {
+                    "name": "libfoo",
+                    "version": "1.0.0",
+                    "type": "deb",
+                    "licenses": [
+                        "https://www.apache.org/licenses/LICENSE-2.0.txt",
+                        {"value": "MIT", "spdxExpression": "MIT", "type": "declared"}
+                    ]
+                }
+            }]
+        }"#;
+
+        // On `main` this `from_str` fails with `invalid type: string "..."`.
+        let report: GrypeReport = serde_json::from_str(json).expect("must parse");
+        let licenses = report.matches[0]
+            .artifact
+            .licenses
+            .as_ref()
+            .expect("licenses must parse");
+        assert_eq!(licenses.len(), 2);
+
+        // Bare string -> value only, no SPDX expression.
+        assert_eq!(
+            licenses[0].value.as_deref(),
+            Some("https://www.apache.org/licenses/LICENSE-2.0.txt")
+        );
+        assert_eq!(licenses[0].spdx_expression.as_deref(), None);
+
+        // Object form -> both fields preserved.
+        assert_eq!(licenses[1].value.as_deref(), Some("MIT"));
+        assert_eq!(licenses[1].spdx_expression.as_deref(), Some("MIT"));
     }
 }

@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::models::security::{RawFinding, RawPackage, ScanResult, Severity};
+use crate::models::security::{RawFinding, RawPackage, Severity};
 use crate::services::grype_scanner::GrypeScanner;
 use crate::services::image_scanner::ImageScanner;
 use crate::services::scan_config_service::ScanConfigService;
@@ -205,6 +205,177 @@ pub fn is_oci_digest_reference(reference: &str) -> bool {
             && hex.chars().all(|c| c.is_ascii_hexdigit())
     } else {
         false
+    }
+}
+
+/// Normalize the host CPU architecture to the OCI `platform.architecture`
+/// token used in image-index child descriptors (`amd64`, `arm64`, ...).
+///
+/// `std::env::consts::ARCH` reports the Rust target triple's arch (`x86_64`,
+/// `aarch64`), which does not match the OCI/Go `GOARCH` vocabulary an image
+/// index uses. We only map the two architectures Artifact Keeper actually
+/// runs on; anything else passes through unchanged so an exotic runner still
+/// gets a deterministic (if non-matching) token and falls back to the first
+/// linux child during resolution rather than panicking. Pure + host-stable so
+/// it can anchor the resolution unit tests (#1971).
+pub fn runner_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
+/// Outcome of resolving a scan reference against an in-hand manifest body.
+///
+/// Distinct variants make the three behaviors testable without inspecting the
+/// returned string: a single-arch / unparseable body is a no-op
+/// (`Passthrough`), an image index that yields a concrete scannable child
+/// rewrites the reference to that child digest (`ResolvedIndexChild`), and an
+/// index whose only children are attestation/unknown/empty manifests cannot be
+/// scanned at all (`UnresolvableIndex`, reference left unchanged so the caller
+/// still attempts the index ref rather than skipping the scan). See #1971.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanReferenceResolution {
+    /// Body is not an image index (single-arch image, malformed, or empty):
+    /// the reference is returned unchanged. The dominant single-arch path
+    /// (and digest-pinned #1483 refs) must hit this branch byte-for-byte.
+    Passthrough(String),
+    /// Body is an image index and a concrete scannable child platform manifest
+    /// was selected; the reference now addresses that child by digest.
+    ResolvedIndexChild(String),
+    /// Body is an image index but every child is attestation/unknown/empty, so
+    /// no scannable child digest exists. The reference is returned unchanged.
+    UnresolvableIndex(String),
+}
+
+impl ScanReferenceResolution {
+    /// The (possibly rewritten) reference to hand to the builders.
+    pub fn into_reference(self) -> String {
+        match self {
+            ScanReferenceResolution::Passthrough(r)
+            | ScanReferenceResolution::ResolvedIndexChild(r)
+            | ScanReferenceResolution::UnresolvableIndex(r) => r,
+        }
+    }
+}
+
+/// Whether an image-index child descriptor is an attestation / non-runnable
+/// manifest that must never be selected as a scan target. Selecting one
+/// re-introduces the empty-inventory bug (#1971), because attestation
+/// manifests carry no installed packages.
+///
+/// A child is excluded when ANY of the following hold:
+///   * `platform.os` or `platform.architecture` is `unknown` (the conventional
+///     marker `docker buildx` stamps onto attestation children),
+///   * `annotations["vnd.docker.reference.type"]` is `attestation-manifest`,
+///   * `artifactType` contains `in-toto` (SLSA/provenance attestations).
+fn is_excluded_index_child(child: &serde_json::Value) -> bool {
+    let platform = child.get("platform");
+    let os = platform
+        .and_then(|p| p.get("os"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let arch = platform
+        .and_then(|p| p.get("architecture"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if os.eq_ignore_ascii_case("unknown") || arch.eq_ignore_ascii_case("unknown") {
+        return true;
+    }
+    if child
+        .get("annotations")
+        .and_then(|a| a.get("vnd.docker.reference.type"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|t| t.eq_ignore_ascii_case("attestation-manifest"))
+    {
+        return true;
+    }
+    if child
+        .get("artifactType")
+        .and_then(|v| v.as_str())
+        .is_some_and(|t| t.to_ascii_lowercase().contains("in-toto"))
+    {
+        return true;
+    }
+    false
+}
+
+/// Resolve a scan `reference` against the manifest `body` the orchestrator
+/// already loaded for this artifact (#1971).
+///
+/// When `body` is an OCI / Docker image **index** (manifest list), grype and
+/// trivy would otherwise rely on their own default platform pick; if no child
+/// matches the runner platform — or the only match is an attestation/empty
+/// manifest — the scan catalogs zero packages and the SBOM is empty. To avoid
+/// that, we select a concrete scannable child-platform manifest digest from
+/// the body and rewrite the reference to address it directly, so the scanner
+/// enumerates a real image. Selection order:
+///
+/// 1. the child whose `platform.architecture` matches [`runner_arch`] (and
+///    `platform.os == "linux"`),
+/// 2. else the first `linux` child,
+/// 3. else the first remaining candidate.
+///
+/// Attestation/unknown children are excluded up front (see
+/// [`is_excluded_index_child`]).
+///
+/// For any body that is not an image index (single-arch image, malformed,
+/// empty, or missing the `manifests` array) the reference is returned
+/// unchanged ([`ScanReferenceResolution::Passthrough`]) so the dominant
+/// single-arch and digest-pinned (#1483) paths are byte-for-byte untouched.
+/// This is a pure parse + string rewrite: no network, fully unit-testable.
+pub fn resolve_scan_reference(body: &[u8], reference: &str) -> ScanReferenceResolution {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return ScanReferenceResolution::Passthrough(reference.to_string());
+    };
+    let Some(manifests) = json.get("manifests").and_then(|m| m.as_array()) else {
+        // Not an image index (single-arch image manifest or other): no-op.
+        return ScanReferenceResolution::Passthrough(reference.to_string());
+    };
+
+    // Candidate = scannable child with a digest, excluding attestation/unknown.
+    let candidates: Vec<&serde_json::Value> = manifests
+        .iter()
+        .filter(|child| {
+            child
+                .get("digest")
+                .and_then(|d| d.as_str())
+                .is_some_and(|d| !d.is_empty())
+                && !is_excluded_index_child(child)
+        })
+        .collect();
+
+    let child_os = |c: &serde_json::Value| -> String {
+        c.get("platform")
+            .and_then(|p| p.get("os"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let child_arch = |c: &serde_json::Value| -> String {
+        c.get("platform")
+            .and_then(|p| p.get("architecture"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    let selected = candidates
+        .iter()
+        .find(|c| child_os(c) == "linux" && child_arch(c) == runner_arch())
+        .or_else(|| candidates.iter().find(|c| child_os(c) == "linux"))
+        .or_else(|| candidates.first());
+
+    match selected {
+        Some(child) => {
+            let digest = child
+                .get("digest")
+                .and_then(|d| d.as_str())
+                .unwrap_or_default();
+            ScanReferenceResolution::ResolvedIndexChild(digest.to_string())
+        }
+        None => ScanReferenceResolution::UnresolvableIndex(reference.to_string()),
     }
 }
 
@@ -445,45 +616,13 @@ pub(crate) fn is_within_dedup_ttl(
     completed_at >= cutoff
 }
 
-/// Outcome of consulting `find_existing_scan_for_artifact` for a single
-/// scanner inside `prepare_artifact_scan`.
-///
-/// Captures the branch the DB-bound caller must take after the query:
-/// either short-circuit and reuse the existing scan id in the trigger
-/// response (no new placeholder, no fresh scan), or fall through to
-/// inserting a new `running` placeholder. Splitting this out makes the
-/// branch unit-testable without a database and pins the contract that
-/// the existing-scan id (not a newly minted UUID) is what gets surfaced
-/// to clients on the dedup path.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ShortCircuitDecision {
-    /// Reuse the existing scan's id directly. No placeholder row, no
-    /// fresh scan: the artifact already has a completed scan for these
-    /// bytes and this scanner.
-    UseExisting(Uuid),
-    /// No usable existing scan; the caller must insert a fresh
-    /// placeholder and queue the scan normally.
-    InsertPlaceholder,
-}
-
-/// Decide whether to short-circuit the prepare step for one scanner.
-///
-/// Wraps the `Option<&ScanResult>` returned by
-/// `ScanResultService::find_existing_scan_for_artifact`. Pulled out so
-/// the actual SQL stays thin (integration-tested) and the decision
-/// logic stays pure (unit-tested).
-///
-/// Pre-#1373, this branch did not exist: every prepare iteration
-/// inserted a placeholder unconditionally, which is what produced the
-/// duplicate completed rows the release gate caught.
-pub(crate) fn decide_short_circuit_from_existing(
-    existing: Option<&ScanResult>,
-) -> ShortCircuitDecision {
-    match existing {
-        Some(scan) => ShortCircuitDecision::UseExisting(scan.id),
-        None => ShortCircuitDecision::InsertPlaceholder,
-    }
-}
+// The check-then-act decision that used to live here (the
+// `ShortCircuitDecision` enum + `decide_short_circuit_from_existing`) was
+// removed in #1935: the SELECT-existing/INSERT-placeholder branch it modeled
+// raced under concurrent triggers. The decision is now made atomically inside
+// `ScanResultService::prepare_scan_placeholder`, under a per-(artifact_id,
+// scan_type) advisory lock, so there is no longer a database-free branch to
+// unit-test in isolation.
 
 /// Outcome of the same-artifact branch inside `scan_artifact_inner` when
 /// `find_reusable_scan` returns a row whose `artifact_id` matches the
@@ -2614,43 +2753,45 @@ impl ScannerService {
         // gets the missing scanner queued normally.
         let mut prepared = Vec::with_capacity(self.scanners.len());
         for scanner in &self.scanners {
-            // When the caller asked to bypass dedup, skip the lookup entirely
-            // and always insert a fresh placeholder. We deliberately don't
-            // even SELECT here so the explicit-rescan path can't accidentally
-            // be diverted by a row that happens to satisfy the TTL.
-            let existing = if bypass_dedup {
-                None
-            } else {
-                self.scan_result_service
-                    .find_existing_scan_for_artifact(
+            if bypass_dedup {
+                // When the caller asked to bypass dedup, skip the dedup
+                // lookup entirely and always insert a fresh placeholder. We
+                // deliberately don't even SELECT here so the explicit-rescan
+                // path can't accidentally be diverted by a row that happens
+                // to satisfy the TTL.
+                let row = self
+                    .scan_result_service
+                    .create_scan_result_with_checksum(
                         artifact_id,
-                        &artifact.checksum_sha256,
+                        artifact.repository_id,
                         scanner.scan_type(),
-                        DEDUP_TTL_DAYS,
-                        ZERO_FINDINGS_DEDUP_TTL_DAYS,
+                        Some(&artifact.checksum_sha256),
                     )
-                    .await
-                    .ok()
-                    .flatten()
-            };
-
-            match decide_short_circuit_from_existing(existing.as_ref()) {
-                ShortCircuitDecision::UseExisting(id) => {
-                    prepared.push((scanner.scan_type().to_string(), id));
-                }
-                ShortCircuitDecision::InsertPlaceholder => {
-                    let row = self
-                        .scan_result_service
-                        .create_scan_result_with_checksum(
-                            artifact_id,
-                            artifact.repository_id,
-                            scanner.scan_type(),
-                            Some(&artifact.checksum_sha256),
-                        )
-                        .await?;
-                    prepared.push((scanner.scan_type().to_string(), row.id));
-                }
+                    .await?;
+                prepared.push((scanner.scan_type().to_string(), row.id));
+                continue;
             }
+
+            // #1935: the dedup check (look up existing scan) and the
+            // placeholder insert must be atomic. `prepare_scan_placeholder`
+            // serializes both under a per-(artifact_id, scan_type) advisory
+            // lock so concurrent triggers on the same fresh artifact can no
+            // longer each insert a duplicate `running` placeholder. It
+            // short-circuits to an existing completed scan (the #1373 path)
+            // or to an in-flight placeholder committed by a racing prepare,
+            // and only inserts when neither exists.
+            let (id, _inserted) = self
+                .scan_result_service
+                .prepare_scan_placeholder(
+                    artifact_id,
+                    artifact.repository_id,
+                    &artifact.checksum_sha256,
+                    scanner.scan_type(),
+                    DEDUP_TTL_DAYS,
+                    ZERO_FINDINGS_DEDUP_TTL_DAYS,
+                )
+                .await?;
+            prepared.push((scanner.scan_type().to_string(), id));
         }
 
         Ok(prepared)
@@ -9575,7 +9716,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // #1373 short-circuit predicates: is_within_dedup_ttl,
-    // decide_short_circuit_from_existing, decide_same_artifact_action.
+    // decide_same_artifact_action.
     //
     // These are the pure decision helpers underpinning the same-artifact
     // dedup short-circuit. The DB-coupled wrappers
@@ -9584,32 +9725,6 @@ mod tests {
     // `backend/tests/scan_dedup_short_circuit_tests.rs`; this section
     // pins the logic that does not need a database.
     // -----------------------------------------------------------------------
-
-    /// Build a minimal ScanResult for predicate tests. Only fields the
-    /// decision functions inspect are meaningful; everything else is
-    /// zero/default.
-    fn fake_scan_result(id: Uuid) -> ScanResult {
-        ScanResult {
-            id,
-            artifact_id: Uuid::nil(),
-            repository_id: Uuid::nil(),
-            scan_type: "trivy".to_string(),
-            status: "completed".to_string(),
-            findings_count: 0,
-            critical_count: 0,
-            high_count: 0,
-            medium_count: 0,
-            low_count: 0,
-            info_count: 0,
-            scanner_version: None,
-            error_message: None,
-            started_at: None,
-            completed_at: Some(Utc::now()),
-            created_at: Utc::now(),
-            is_reused: false,
-            source_scan_id: None,
-        }
-    }
 
     #[test]
     fn test_is_within_dedup_ttl_just_completed_is_within() {
@@ -9692,35 +9807,6 @@ mod tests {
         let now = Utc::now();
         let future = now + chrono::Duration::minutes(5);
         assert!(is_within_dedup_ttl(Some(future), now, 30));
-    }
-
-    #[test]
-    fn test_decide_short_circuit_from_existing_some_returns_use_existing() {
-        let id = Uuid::new_v4();
-        let scan = fake_scan_result(id);
-        let decision = decide_short_circuit_from_existing(Some(&scan));
-        assert_eq!(decision, ShortCircuitDecision::UseExisting(id));
-    }
-
-    #[test]
-    fn test_decide_short_circuit_from_existing_none_returns_insert_placeholder() {
-        let decision = decide_short_circuit_from_existing(None);
-        assert_eq!(decision, ShortCircuitDecision::InsertPlaceholder);
-    }
-
-    #[test]
-    fn test_decide_short_circuit_uses_scan_id_not_artifact_id() {
-        // Regression: the decision must surface the SCAN id, not the
-        // artifact id. Pre-#1373 the trigger response leaked a fresh
-        // placeholder UUID; the fix is meaningless if we ever return
-        // the wrong field here.
-        let scan_id = Uuid::new_v4();
-        let artifact_id = Uuid::new_v4();
-        let mut scan = fake_scan_result(scan_id);
-        scan.artifact_id = artifact_id;
-        assert_ne!(scan_id, artifact_id);
-        let decision = decide_short_circuit_from_existing(Some(&scan));
-        assert_eq!(decision, ShortCircuitDecision::UseExisting(scan_id));
     }
 
     #[test]
@@ -9808,21 +9894,6 @@ mod tests {
         let action =
             decide_same_artifact_action(&PreparedScanAction::Reuse(Uuid::nil()), Uuid::nil());
         assert_eq!(action, SameArtifactAction::NoOp);
-    }
-
-    #[test]
-    fn test_short_circuit_decision_distinct_ids_are_distinct() {
-        // Sanity: two different scans short-circuit to different
-        // decisions. Catches an accidental `_` -> always-same-id
-        // pattern in a future refactor.
-        let id1 = Uuid::new_v4();
-        let id2 = Uuid::new_v4();
-        let s1 = fake_scan_result(id1);
-        let s2 = fake_scan_result(id2);
-        assert_ne!(
-            decide_short_circuit_from_existing(Some(&s1)),
-            decide_short_circuit_from_existing(Some(&s2)),
-        );
     }
 
     #[test]
@@ -11068,6 +11139,170 @@ mod tests {
             "digest ref must not use ':' between name and digest: {}",
             joined
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #1971: resolve_scan_reference — OCI image-index → concrete child digest.
+    // Pure JSON parse + reference rewrite; no DB, no network, host-stable via
+    // runner_arch().
+    // -----------------------------------------------------------------------
+
+    const SHA_AMD64: &str =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    const SHA_ARM64: &str =
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    const SHA_ATTEST: &str =
+        "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+
+    fn index_two_arch() -> String {
+        format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json",
+                "manifests":[
+                  {{"digest":"{SHA_AMD64}","platform":{{"os":"linux","architecture":"amd64"}}}},
+                  {{"digest":"{SHA_ARM64}","platform":{{"os":"linux","architecture":"arm64"}}}}
+                ]}}"#
+        )
+    }
+
+    /// (1) An index with both runner-relevant arches resolves to the
+    /// runner-arch child digest (host-stable via runner_arch()).
+    #[test]
+    fn test_resolve_scan_reference_index_picks_runner_arch() {
+        let body = index_two_arch();
+        let res = resolve_scan_reference(body.as_bytes(), "latest");
+        let expected = match runner_arch() {
+            "amd64" => SHA_AMD64,
+            "arm64" => SHA_ARM64,
+            // On an exotic runner neither linux child matches the arch, so the
+            // first linux child wins; assert it is one of the two real digests.
+            _ => SHA_AMD64,
+        };
+        assert_eq!(
+            res,
+            ScanReferenceResolution::ResolvedIndexChild(expected.to_string())
+        );
+        // The joined builder form is name@sha256:... — assert via join.
+        assert_eq!(
+            join_oci_image_ref("host/repo/app", &res.into_reference()),
+            format!("host/repo/app@{}", expected)
+        );
+    }
+
+    /// (2) An index missing the runner arch falls back to the first linux
+    /// child (never empty / never UnresolvableIndex).
+    #[test]
+    fn test_resolve_scan_reference_index_falls_back_to_first_linux_child() {
+        // Single child whose arch is deliberately not the runner arch.
+        let other_arch = if runner_arch() == "amd64" {
+            "arm64"
+        } else {
+            "amd64"
+        };
+        let body = format!(
+            r#"{{"manifests":[
+                 {{"digest":"{SHA_AMD64}","platform":{{"os":"linux","architecture":"{other_arch}"}}}}
+               ]}}"#
+        );
+        let res = resolve_scan_reference(body.as_bytes(), "latest");
+        assert_eq!(
+            res,
+            ScanReferenceResolution::ResolvedIndexChild(SHA_AMD64.to_string())
+        );
+    }
+
+    /// (3) An index with an attestation child plus one real child selects the
+    /// real child, never the attestation digest.
+    #[test]
+    fn test_resolve_scan_reference_excludes_attestation_child() {
+        let body = format!(
+            r#"{{"manifests":[
+                 {{"digest":"{SHA_ATTEST}","platform":{{"os":"unknown","architecture":"unknown"}},
+                   "annotations":{{"vnd.docker.reference.type":"attestation-manifest"}}}},
+                 {{"digest":"{SHA_AMD64}","platform":{{"os":"linux","architecture":"{arch}"}}}}
+               ]}}"#,
+            arch = runner_arch()
+        );
+        let res = resolve_scan_reference(body.as_bytes(), "latest");
+        assert_eq!(
+            res,
+            ScanReferenceResolution::ResolvedIndexChild(SHA_AMD64.to_string()),
+            "must never select the attestation child"
+        );
+        assert_ne!(res.into_reference(), SHA_ATTEST);
+    }
+
+    /// (3b) artifactType in-toto and os=unknown are independently excluding.
+    #[test]
+    fn test_resolve_scan_reference_excludes_in_toto_artifact_type() {
+        let body = format!(
+            r#"{{"manifests":[
+                 {{"digest":"{SHA_ATTEST}","artifactType":"application/vnd.in-toto+json"}},
+                 {{"digest":"{SHA_AMD64}","platform":{{"os":"linux","architecture":"{arch}"}}}}
+               ]}}"#,
+            arch = runner_arch()
+        );
+        assert_eq!(
+            resolve_scan_reference(body.as_bytes(), "latest"),
+            ScanReferenceResolution::ResolvedIndexChild(SHA_AMD64.to_string())
+        );
+    }
+
+    /// (4) An index whose only children are attestation/empty → Unresolvable;
+    /// reference is returned unchanged.
+    #[test]
+    fn test_resolve_scan_reference_attestation_only_index_is_unresolvable() {
+        let body = format!(
+            r#"{{"manifests":[
+                 {{"digest":"{SHA_ATTEST}","platform":{{"os":"unknown","architecture":"unknown"}}}},
+                 {{"platform":{{"os":"linux","architecture":"amd64"}}}}
+               ]}}"#
+        );
+        let res = resolve_scan_reference(body.as_bytes(), "latest");
+        assert_eq!(
+            res,
+            ScanReferenceResolution::UnresolvableIndex("latest".to_string())
+        );
+        assert_eq!(res.into_reference(), "latest");
+    }
+
+    /// (5) REGRESSION: a normal single-arch image manifest body (config, no
+    /// manifests[]) is passthrough — reference byte-for-byte unchanged.
+    #[test]
+    fn test_resolve_scan_reference_single_arch_is_passthrough() {
+        let body = br#"{"schemaVersion":2,"config":{"digest":"sha256:cfg"},"layers":[]}"#;
+        assert_eq!(
+            resolve_scan_reference(body, "v1.0.0"),
+            ScanReferenceResolution::Passthrough("v1.0.0".to_string())
+        );
+        // Digest-pinned single manifest (#1483) also passes through unchanged.
+        assert_eq!(
+            resolve_scan_reference(body, SHA_AMD64),
+            ScanReferenceResolution::Passthrough(SHA_AMD64.to_string())
+        );
+    }
+
+    /// (5b) REGRESSION: malformed / empty bodies are passthrough.
+    #[test]
+    fn test_resolve_scan_reference_malformed_body_is_passthrough() {
+        for body in [&b""[..], &b"not json"[..], &br#"{"schemaVersion":2}"#[..]] {
+            assert_eq!(
+                resolve_scan_reference(body, "latest"),
+                ScanReferenceResolution::Passthrough("latest".to_string())
+            );
+        }
+    }
+
+    /// (6) runner_arch() maps the two architectures Artifact Keeper runs on.
+    #[test]
+    fn test_runner_arch_maps_known_architectures() {
+        // Pure, deterministic on the current host.
+        match std::env::consts::ARCH {
+            "x86_64" => assert_eq!(runner_arch(), "amd64"),
+            "aarch64" => assert_eq!(runner_arch(), "arm64"),
+            other => assert_eq!(runner_arch(), other),
+        }
+        // The returned token must be a non-empty OCI arch token.
+        assert!(!runner_arch().is_empty());
     }
 
     struct ContextOnlyScanner;
