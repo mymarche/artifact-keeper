@@ -29,6 +29,20 @@ use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
 
+use uuid::Uuid;
+
+/// Row type for pub artifact queries (used in virtual member resolution).
+#[derive(sqlx::FromRow)]
+#[allow(dead_code)]
+struct PubArtifactRow {
+    id: Uuid,
+    name: String,
+    version: Option<String>,
+    size_bytes: i64,
+    checksum_sha256: String,
+    metadata: Option<serde_json::Value>,
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -101,6 +115,95 @@ async fn package_info(
     })?;
 
     if artifacts.is_empty() {
+        // Remote repo: proxy metadata to upstream
+        if repo.repo_type == RepositoryType::Remote {
+            if let Some(ref upstream_url) = repo.upstream_url {
+                let api_path = format!("api/packages/{}", name);
+                if let Some(resp) = proxy_pub_meta_get(upstream_url, &api_path).await {
+                    return Ok(resp);
+                }
+            }
+            return Err(pub_error_response(
+                StatusCode::NOT_FOUND,
+                "NOT_FOUND",
+                "Package not found",
+            ));
+        }
+
+        // Virtual repo: resolve through members in priority order
+        if repo.repo_type == RepositoryType::Virtual {
+            let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+            for member in &members {
+                match member.repo_type {
+                    RepositoryType::Local | RepositoryType::Staging => {
+                        let member_artifacts = sqlx::query_as::<_, PubArtifactRow>(
+                            "SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256, \
+                              am.metadata \
+                              FROM artifacts a \
+                              LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+                              WHERE a.repository_id = $1 \
+                                AND a.is_deleted = false \
+                                AND LOWER(a.name) = LOWER($2) \
+                              ORDER BY a.created_at DESC",
+                        )
+                        .bind(member.id)
+                        .bind(&name)
+                        .fetch_all(&state.db)
+                        .await
+                        .map_err(|e| {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Database error: {}", e),
+                            )
+                                .into_response()
+                        })?;
+
+                        if !member_artifacts.is_empty() {
+                            let versions: Vec<serde_json::Value> = member_artifacts
+                                .iter()
+                                .map(|a| {
+                                    let ver = a.version.clone().unwrap_or_default();
+                                    serde_json::json!({
+                                        "version": ver,
+                                        "archive_url": format!(
+                                            "{}/pub/{}/packages/{}/versions/{}.tar.gz",
+                                            base_url.as_str(),
+                                            repo_key,
+                                            name,
+                                            ver
+                                        ),
+                                        "archive_sha256": a.checksum_sha256,
+                                        "pubspec": a.metadata.as_ref()
+                                            .and_then(|m| m.get("pubspec"))
+                                            .cloned()
+                                            .unwrap_or_else(|| serde_json::json!({
+                                                "name": name,
+                                                "version": ver,
+                                            })),
+                                    })
+                                })
+                                .collect();
+                            return Ok(build_pub_package_response(&name, versions));
+                        }
+                    }
+                    RepositoryType::Remote => {
+                        if let Some(ref upstream_url) = member.upstream_url {
+                            let api_path = format!("api/packages/{}", name);
+                            if let Some(resp) = proxy_pub_meta_get(upstream_url, &api_path).await {
+                                return Ok(resp);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return Err(pub_error_response(
+                StatusCode::NOT_FOUND,
+                "NOT_FOUND",
+                "Package not found",
+            ));
+        }
+
         return Err(pub_error_response(
             StatusCode::NOT_FOUND,
             "NOT_FOUND",
@@ -111,49 +214,28 @@ async fn package_info(
     let versions: Vec<serde_json::Value> = artifacts
         .iter()
         .map(|a| {
-            let version = a.version.clone().unwrap_or_default();
-            let archive_url = format!(
-                "{}/pub/{}/packages/{}/versions/{}.tar.gz",
-                base_url.as_str(),
-                repo_key,
-                name,
-                version
-            );
-
-            let pubspec = a
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("pubspec"))
-                .cloned()
-                .unwrap_or_else(|| {
-                    serde_json::json!({
-                        "name": name,
-                        "version": version,
-                    })
-                });
-
+            let ver = a.version.clone().unwrap_or_default();
             serde_json::json!({
-                "version": version,
-                "archive_url": archive_url,
+                "version": ver,
+                "archive_url": format!(
+                    "{}/pub/{}/packages/{}/versions/{}.tar.gz",
+                    base_url.as_str(),
+                    repo_key,
+                    name,
+                    ver
+                ),
                 "archive_sha256": a.checksum_sha256,
-                "pubspec": pubspec,
+                "pubspec": a.metadata.as_ref()
+                    .and_then(|m| m.get("pubspec"))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({
+                        "name": name,
+                        "version": ver,
+                    })),
             })
         })
         .collect();
-
-    let latest = versions.first().cloned().unwrap_or(serde_json::json!(null));
-
-    let json = serde_json::json!({
-        "name": name,
-        "latest": latest,
-        "versions": versions,
-    });
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/vnd.pub.v2+json")
-        .body(Body::from(serde_json::to_string(&json).unwrap()))
-        .unwrap())
+    Ok(build_pub_package_response(&name, versions))
 }
 
 // ---------------------------------------------------------------------------
@@ -191,8 +273,100 @@ async fn version_info(
             format!("Database error: {}", e),
         )
             .into_response()
-    })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Version not found").into_response())?;
+    })?;
+
+    let artifact = match artifact {
+        Some(a) => a,
+        None => {
+            // Remote repo: proxy metadata to upstream
+            if repo.repo_type == RepositoryType::Remote {
+                if let Some(ref upstream_url) = repo.upstream_url {
+                    let api_path = format!("api/packages/{}/versions/{}", name, version);
+                    if let Some(resp) = proxy_pub_meta_get(upstream_url, &api_path).await {
+                        return Ok(resp);
+                    }
+                }
+                return Err((StatusCode::NOT_FOUND, "Version not found").into_response());
+            }
+
+            // Virtual repo: resolve through members in priority order
+            if repo.repo_type == RepositoryType::Virtual {
+                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+                for member in &members {
+                    match member.repo_type {
+                        RepositoryType::Local | RepositoryType::Staging => {
+                            let member_artifact = sqlx::query_as::<_, PubArtifactRow>(
+                                "SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256, \
+                                  am.metadata \
+                                  FROM artifacts a \
+                                  LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+                                  WHERE a.repository_id = $1 \
+                                    AND a.is_deleted = false \
+                                    AND LOWER(a.name) = LOWER($2) \
+                                    AND a.version = $3 \
+                                  LIMIT 1",
+                            )
+                            .bind(member.id)
+                            .bind(&name)
+                            .bind(&version)
+                            .fetch_optional(&state.db)
+                            .await
+                            .map_err(|e| {
+                                (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    format!("Database error: {}", e),
+                                )
+                                    .into_response()
+                            })?;
+
+                            if let Some(a) = member_artifact {
+                                let ver = a.version.clone().unwrap_or_default();
+                                let archive_url = format!(
+                                    "{}/pub/{}/packages/{}/versions/{}.tar.gz",
+                                    base_url.as_str(),
+                                    repo_key,
+                                    name,
+                                    ver
+                                );
+                                let pubspec = a
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("pubspec"))
+                                    .cloned()
+                                    .unwrap_or_else(|| {
+                                        serde_json::json!({
+                                            "name": name,
+                                            "version": ver,
+                                        })
+                                    });
+                                return Ok(build_pub_version_response(
+                                    &ver,
+                                    &archive_url,
+                                    &a.checksum_sha256,
+                                    &pubspec,
+                                ));
+                            }
+                        }
+                        RepositoryType::Remote => {
+                            if let Some(ref upstream_url) = member.upstream_url {
+                                let api_path =
+                                    format!("api/packages/{}/versions/{}", name, version);
+                                if let Some(resp) =
+                                    proxy_pub_meta_get(upstream_url, &api_path).await
+                                {
+                                    return Ok(resp);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                return Err((StatusCode::NOT_FOUND, "Version not found").into_response());
+            }
+
+            return Err((StatusCode::NOT_FOUND, "Version not found").into_response());
+        }
+    };
 
     let ver = artifact.version.clone().unwrap_or_default();
     let archive_url = format!(
@@ -202,7 +376,6 @@ async fn version_info(
         name,
         ver
     );
-
     let pubspec = artifact
         .metadata
         .as_ref()
@@ -214,19 +387,12 @@ async fn version_info(
                 "version": ver,
             })
         });
-
-    let json = serde_json::json!({
-        "version": ver,
-        "archive_url": archive_url,
-        "archive_sha256": artifact.checksum_sha256,
-        "pubspec": pubspec,
-    });
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/vnd.pub.v2+json")
-        .body(Body::from(serde_json::to_string(&json).unwrap()))
-        .unwrap())
+    Ok(build_pub_version_response(
+        &ver,
+        &archive_url,
+        &artifact.checksum_sha256,
+        &pubspec,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -660,6 +826,97 @@ fn pub_error_response(status: StatusCode, code: &str, message: &str) -> Response
         .header(CONTENT_TYPE, "application/vnd.pub.v2+json")
         .body(Body::from(serde_json::to_string(&json).unwrap()))
         .unwrap()
+}
+
+/// Build a Pub-spec package info JSON response from pre-built version entries.
+fn build_pub_package_response(name: &str, versions: Vec<serde_json::Value>) -> Response {
+    let latest = versions.first().cloned().unwrap_or(serde_json::json!(null));
+
+    let json = serde_json::json!({
+        "name": name,
+        "latest": latest,
+        "versions": versions,
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/vnd.pub.v2+json")
+        .body(Body::from(serde_json::to_string(&json).unwrap()))
+        .unwrap()
+}
+
+/// Build a Pub-spec version info JSON response from individual fields.
+fn build_pub_version_response(
+    version: &str,
+    archive_url: &str,
+    checksum_sha256: &str,
+    pubspec: &serde_json::Value,
+) -> Response {
+    let json = serde_json::json!({
+        "version": version,
+        "archive_url": archive_url,
+        "archive_sha256": checksum_sha256,
+        "pubspec": pubspec,
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/vnd.pub.v2+json")
+        .body(Body::from(serde_json::to_string(&json).unwrap()))
+        .unwrap()
+}
+
+/// Forward a GET request to the upstream Pub registry for package metadata.
+///
+/// Returns the upstream status + body verbatim. On any transport error (DNS,
+/// TLS, timeout) returns `None` so the caller can fall through to other
+/// resolution strategies.
+async fn proxy_pub_meta_get(upstream_url: &str, api_path: &str) -> Option<Response> {
+    let base = upstream_url.trim_end_matches('/');
+    let url = format!("{}/{}", base, api_path.trim_start_matches('/'));
+    let client = crate::services::http_client::default_client();
+
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::debug!(
+                target: "pub_meta",
+                upstream = %url,
+                error = %err,
+                "Pub meta GET upstream unreachable"
+            );
+            return None;
+        }
+    };
+
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = resp
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/vnd.pub.v2+json")
+        .to_string();
+
+    match resp.bytes().await {
+        Ok(bytes) => Some(
+            Response::builder()
+                .status(status)
+                .header(CONTENT_TYPE, content_type)
+                .body(Body::from(bytes))
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "upstream error").into_response()
+                }),
+        ),
+        Err(err) => {
+            tracing::debug!(
+                target: "pub_meta",
+                upstream = %url,
+                error = %err,
+                "Pub meta GET failed to read upstream body"
+            );
+            None
+        }
+    }
 }
 
 /// Extract pubspec.yaml from a Pub package tar.gz archive.
