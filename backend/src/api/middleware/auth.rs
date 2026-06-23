@@ -186,9 +186,9 @@ impl From<User> for AuthExtension {
 #[allow(clippy::result_large_err)]
 pub fn require_auth_basic(
     auth: Option<AuthExtension>,
-    _realm: &str,
+    realm: &str,
 ) -> std::result::Result<AuthExtension, Response> {
-    auth.ok_or_else(unauthorized_response)
+    auth.ok_or_else(|| unauthorized_response(realm))
 }
 
 /// Like [`require_auth_basic`] but additionally enforces the given API-token
@@ -1082,7 +1082,7 @@ pub async fn optional_auth_middleware(
     // browser may include a stale Authorization cookie alongside a fresh
     // download ticket — the ticket is what authorizes the read.
     if credential_invalid && auth_ext.is_none() {
-        return unauthorized_response();
+        return unauthorized_response("artifact-keeper");
     }
 
     request.extensions_mut().insert(auth_ext);
@@ -1211,13 +1211,13 @@ fn is_write_method(method: &Method) -> bool {
 /// Build a 401 response with `WWW-Authenticate` challenges for both Basic
 /// and Bearer schemes.  Package manager clients use the challenge to decide
 /// how to retry with credentials.
-fn unauthorized_response() -> Response {
+fn unauthorized_response(realm: &str) -> Response {
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
-        .header("WWW-Authenticate", "Basic realm=\"artifact-keeper\"")
+        .header("WWW-Authenticate", format!("Basic realm=\"{realm}\""))
         .header(
             "WWW-Authenticate",
-            "Bearer realm=\"artifact-keeper\", charset=\"UTF-8\"",
+            format!("Bearer realm=\"{realm}\", charset=\"UTF-8\""),
         )
         // Signals cargo 1.67+ to use the Cargo token protocol (sends the token
         // as the raw Authorization header value) rather than aborting on the
@@ -1422,10 +1422,10 @@ pub async fn repo_visibility_middleware(
             AuthOutcome::Overloaded => None,
         };
         if credential_invalid && auth_ext.is_none() {
-            return unauthorized_response();
+            return unauthorized_response("artifact-keeper");
         }
         if no_credential {
-            return unauthorized_response();
+            return unauthorized_response("artifact-keeper");
         }
         // Note: `credential_invalid` was captured before the match consumed
         // `outcome`; this mirrors the pattern further down for the repo-hit
@@ -1470,7 +1470,7 @@ pub async fn repo_visibility_middleware(
     // Off-boarding (#1371): explicit credential presented but invalid (and
     // no rescuing ticket) means 401, not anonymous read.
     if credential_invalid && auth_ext.is_none() {
-        return unauthorized_response();
+        return unauthorized_response("artifact-keeper");
     }
 
     // Insert auth extension for downstream handlers.
@@ -1490,12 +1490,12 @@ pub async fn repo_visibility_middleware(
     // the purpose of write gating.
     let has_write_auth = auth_ext.is_some() && !authed_via_ticket;
     if is_write && !has_write_auth {
-        return unauthorized_response();
+        return unauthorized_response("artifact-keeper");
     }
 
     // Check visibility: public repos are open for reads, private repos need auth.
     if !should_allow_repo_access(is_public, auth_ext.is_some()) {
-        return unauthorized_response();
+        return unauthorized_response("artifact-keeper");
     }
 
     // #504: Enforce API token repository scope. If the token carries an
@@ -2317,13 +2317,13 @@ mod tests {
 
     #[test]
     fn test_unauthorized_response_status() {
-        let resp = unauthorized_response();
+        let resp = unauthorized_response("artifact-keeper");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
     fn test_unauthorized_response_has_www_authenticate_headers() {
-        let resp = unauthorized_response();
+        let resp = unauthorized_response("artifact-keeper");
         let www_auth_values: Vec<&str> = resp
             .headers()
             .get_all("WWW-Authenticate")
@@ -2369,7 +2369,7 @@ mod tests {
 
     #[test]
     fn test_unauthorized_response_content_type() {
-        let resp = unauthorized_response();
+        let resp = unauthorized_response("artifact-keeper");
         let ct = resp
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
