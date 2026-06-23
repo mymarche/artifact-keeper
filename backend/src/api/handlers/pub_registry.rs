@@ -1175,4 +1175,399 @@ mod tests {
 
         fixture.teardown().await;
     }
+
+    // -----------------------------------------------------------------------
+    // build_pub_package_response / build_pub_version_response unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_pub_package_response_returns_versions() {
+        use futures::FutureExt;
+        let versions = vec![
+            serde_json::json!({"version": "1.0.0", "archive_url": "/pub/r/pkg/1.0.0.tar.gz"}),
+            serde_json::json!({"version": "1.1.0", "archive_url": "/pub/r/pkg/1.1.0.tar.gz"}),
+        ];
+        let resp = build_pub_package_response("test_pkg", versions);
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap(),
+            "application/vnd.pub.v2+json"
+        );
+
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .now_or_never()
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["name"], "test_pkg");
+        assert!(body["versions"].is_array());
+        assert_eq!(body["versions"].as_array().unwrap().len(), 2);
+        assert_eq!(body["latest"]["version"], "1.0.0");
+    }
+
+    #[test]
+    fn test_build_pub_package_response_empty_versions() {
+        use futures::FutureExt;
+        let versions = vec![];
+        let resp = build_pub_package_response("empty_pkg", versions);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .now_or_never()
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["latest"], serde_json::json!(null));
+        assert!(body["versions"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_build_pub_version_response() {
+        use futures::FutureExt;
+        let pubspec = serde_json::json!({"name": "test_pkg", "version": "2.0.0"});
+        let resp = build_pub_version_response(
+            "2.0.0",
+            "https://ak/pub/r/pkg/2.0.0.tar.gz",
+            "abc123deadbeef",
+            &pubspec,
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap(),
+            "application/vnd.pub.v2+json"
+        );
+
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .now_or_never()
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["version"], "2.0.0");
+        assert_eq!(body["archive_url"], "https://ak/pub/r/pkg/2.0.0.tar.gz");
+        assert_eq!(body["archive_sha256"], "abc123deadbeef");
+        assert_eq!(body["pubspec"]["name"], "test_pkg");
+    }
+
+    // -----------------------------------------------------------------------
+    // Remote repo proxy integration tests
+    // -----------------------------------------------------------------------
+
+    fn mock_pub_package_info(name: &str) -> String {
+        format!(
+            r#"{{"name":"{name}","latest":{{"version":"1.0.0"}},"versions":[{{"version":"1.0.0","archive_url":"https://upstream/pub/{name}/1.0.0.tar.gz","archive_sha256":"abc","pubspec":{{"name":"{name}","version":"1.0.0"}}}}]}}"#,
+            name = name
+        )
+    }
+
+    #[tokio::test]
+    async fn test_remote_repo_package_info_proxied_to_upstream() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pub").await else {
+            return;
+        };
+
+        let mock_server = MockServer::start().await;
+        let pkg = "test_proxy_pkg";
+        let api_path = format!("/api/packages/{}", pkg);
+
+        Mock::given(method("GET"))
+            .and(path(api_path.as_str()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/vnd.pub.v2+json")
+                    .set_body_string(mock_pub_package_info(pkg)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let app = tdh::router_anon(super::router(), fx.state.clone());
+        let uri = format!("/{}/api/packages/{}", fx.repo_key, pkg);
+        let (status, bytes) = tdh::send(app, tdh::get(uri)).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["name"], pkg);
+        assert_eq!(json["versions"][0]["version"], "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_remote_repo_package_info_404_when_upstream_down() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pub").await else {
+            return;
+        };
+
+        // Leave upstream_url pointing to a non-existent server
+        let app = tdh::router_anon(super::router(), fx.state.clone());
+        let uri = format!("/{}/api/packages/missing_pkg", fx.repo_key);
+        let (status, _bytes) = tdh::send(app, tdh::get(uri)).await;
+        fx.teardown().await;
+
+        // When upstream is unreachable the handler returns 404
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_remote_repo_version_info_proxied_to_upstream() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pub").await else {
+            return;
+        };
+
+        let mock_server = MockServer::start().await;
+        let pkg = "test_ver_pkg";
+        let ver = "2.0.0";
+        let api_path = format!("/api/packages/{}/versions/{}", pkg, ver);
+
+        Mock::given(method("GET"))
+            .and(path(api_path.as_str()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/vnd.pub.v2+json")
+                    .set_body_string(format!(
+                        r#"{{"name":"{pkg}","version":"{ver}","archive_url":"https://upstream/pub/{pkg}/{ver}.tar.gz","archive_sha256":"def","pubspec":{{"name":"{pkg}","version":"{ver}}}}}}}"#,
+                    )),
+            )
+            .mount(&mock_server)
+            .await;
+
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let app = tdh::router_anon(super::router(), fx.state.clone());
+        let uri = format!("/{}/api/packages/{}/versions/{}", fx.repo_key, pkg, ver);
+        let (status, bytes) = tdh::send(app, tdh::get(uri)).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["name"], pkg);
+        assert_eq!(json["version"], ver);
+    }
+
+    // -----------------------------------------------------------------------
+    // Virtual repo member resolution integration tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_virtual_repo_package_info_resolves_local_member() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "pub").await else {
+            return;
+        };
+
+        // Create a minimal pub package tar.gz
+        let pubspec_yaml = "name: test_virtual_pkg\nversion: 3.0.0\n";
+        let mut tar_data = Vec::new();
+        {
+            use flate2::write::GzEncoder;
+            use flate2::Compression;
+            use tar::Builder as TarBuilder;
+
+            let encoder = GzEncoder::new(&mut tar_data, Compression::default());
+            let mut tar = TarBuilder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            tar.append_data(&mut header, "pubspec.yaml", pubspec_yaml.as_bytes())
+                .unwrap();
+            let encoder = tar.into_inner().unwrap();
+            encoder.finish().unwrap();
+        }
+
+        // Seed artifact into the local repo
+        let storage_key = "pub/test_virtual_pkg/3.0.0/test_virtual_pkg-3.0.0.tar.gz".to_string();
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &fx.repo_info("local", None),
+            &storage_key,
+            "test_virtual_pkg/3.0.0/test_virtual_pkg-3.0.0.tar.gz",
+            "test_virtual_pkg",
+            "3.0.0",
+            "application/gzip",
+            bytes::Bytes::from(tar_data),
+            fx.user_id,
+        )
+        .await;
+
+        // Create virtual repo using our local repo as a member
+        let virtual_id = Uuid::new_v4();
+        let virtual_key = format!("ph-pub-virtual-{}", virtual_id);
+        let storage_dir = std::env::temp_dir().join(format!("ph-test-{}", virtual_id));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $3, $4, 'virtual'::repository_type, 'pub'::repository_format)",
+        )
+        .bind(virtual_id)
+        .bind(&virtual_key)
+        .bind(&virtual_key)
+        .bind(storage_dir.to_string_lossy().as_ref())
+        .execute(&fx.pool)
+        .await
+        .expect("create virtual repo");
+
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("add member");
+
+        // Also grant access to virtual repo for the fixture user
+        tdh::grant_repo_access(&fx.pool, virtual_id, fx.user_id).await;
+
+        let app = tdh::router_anon(super::router(), fx.state.clone());
+        let uri = format!("/{}/api/packages/test_virtual_pkg", virtual_key);
+        let (status, bytes) = tdh::send(app, tdh::get(uri)).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["name"], "test_virtual_pkg");
+        let versions = json["versions"].as_array().unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0]["version"], "3.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_virtual_repo_package_info_404_when_no_member() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pub").await else {
+            return;
+        };
+        let app = tdh::router_anon(super::router(), fx.state.clone());
+        let uri = format!("/{}/api/packages/missing_pkg", fx.repo_key);
+        let (status, _bytes) = tdh::send(app, tdh::get(uri)).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_virtual_repo_version_info_resolves_local_member() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "pub").await else {
+            return;
+        };
+
+        // Create a minimal pub package tar.gz
+        let pubspec_yaml = "name: test_ver_virtual\nversion: 4.0.0\n";
+        let mut tar_data = Vec::new();
+        {
+            use flate2::write::GzEncoder;
+            use flate2::Compression;
+            use tar::Builder as TarBuilder;
+
+            let encoder = GzEncoder::new(&mut tar_data, Compression::default());
+            let mut tar = TarBuilder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            tar.append_data(&mut header, "pubspec.yaml", pubspec_yaml.as_bytes())
+                .unwrap();
+            let encoder = tar.into_inner().unwrap();
+            encoder.finish().unwrap();
+        }
+
+        let storage_key = "pub/test_ver_virtual/4.0.0/test_ver_virtual-4.0.0.tar.gz".to_string();
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &fx.repo_info("local", None),
+            &storage_key,
+            "test_ver_virtual/4.0.0/test_ver_virtual-4.0.0.tar.gz",
+            "test_ver_virtual",
+            "4.0.0",
+            "application/gzip",
+            bytes::Bytes::from(tar_data),
+            fx.user_id,
+        )
+        .await;
+
+        // Create virtual repo
+        let virtual_id = Uuid::new_v4();
+        let virtual_key = format!("ph-pub-virtual-{}", virtual_id);
+        let storage_dir = std::env::temp_dir().join(format!("ph-test-{}", virtual_id));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $3, $4, 'virtual'::repository_type, 'pub'::repository_format)",
+        )
+        .bind(virtual_id)
+        .bind(&virtual_key)
+        .bind(&virtual_key)
+        .bind(storage_dir.to_string_lossy().as_ref())
+        .execute(&fx.pool)
+        .await
+        .expect("create virtual repo");
+
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("add member");
+
+        tdh::grant_repo_access(&fx.pool, virtual_id, fx.user_id).await;
+
+        let app = tdh::router_anon(super::router(), fx.state.clone());
+        let uri = format!(
+            "/{}/api/packages/test_ver_virtual/versions/4.0.0",
+            virtual_key
+        );
+        let (status, bytes) = tdh::send(app, tdh::get(uri)).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["name"], "test_ver_virtual");
+        assert_eq!(json["version"], "4.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_virtual_repo_version_info_404_when_no_member() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pub").await else {
+            return;
+        };
+        let app = tdh::router_anon(super::router(), fx.state.clone());
+        let uri = format!("/{}/api/packages/missing_pkg/versions/1.0.0", fx.repo_key);
+        let (status, _bytes) = tdh::send(app, tdh::get(uri)).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
 }
