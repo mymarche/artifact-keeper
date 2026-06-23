@@ -52,4 +52,3 @@ jobs:
           build-args: |
             GIT_SHA=${{ github.sha }}
             CARGO_FEATURES=
-            APP_VERSION=${{ inputs.tag }}
