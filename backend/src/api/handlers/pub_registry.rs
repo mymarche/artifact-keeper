@@ -367,6 +367,7 @@ async fn version_info(
                                         })
                                     });
                                 return Ok(build_pub_version_response(
+                                    &name,
                                     &ver,
                                     &archive_url,
                                     &a.checksum_sha256,
@@ -422,6 +423,7 @@ async fn version_info(
             })
         });
     Ok(build_pub_version_response(
+        &name,
         &ver,
         &archive_url,
         &artifact.checksum_sha256,
@@ -881,12 +883,14 @@ fn build_pub_package_response(name: &str, versions: Vec<serde_json::Value>) -> R
 
 /// Build a Pub-spec version info JSON response from individual fields.
 fn build_pub_version_response(
+    name: &str,
     version: &str,
     archive_url: &str,
     checksum_sha256: &str,
     pubspec: &serde_json::Value,
 ) -> Response {
     let json = serde_json::json!({
+        "name": name,
         "version": version,
         "archive_url": archive_url,
         "archive_sha256": checksum_sha256,
@@ -1310,6 +1314,7 @@ mod tests {
         use futures::FutureExt;
         let pubspec = serde_json::json!({"name": "test_pkg", "version": "2.0.0"});
         let resp = build_pub_version_response(
+            "test_pkg",
             "2.0.0",
             "https://ak/pub/r/pkg/2.0.0.tar.gz",
             "abc123deadbeef",
@@ -1328,6 +1333,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
+        assert_eq!(body["name"], "test_pkg");
         assert_eq!(body["version"], "2.0.0");
         assert_eq!(body["archive_url"], "https://ak/pub/r/pkg/2.0.0.tar.gz");
         assert_eq!(body["archive_sha256"], "abc123deadbeef");
@@ -1512,9 +1518,16 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "application/vnd.pub.v2+json")
-                    .set_body_string(format!(
-                        r#"{{"name":"{pkg}","version":"{ver}","archive_url":"https://upstream/pub/{pkg}/{ver}.tar.gz","archive_sha256":"def","pubspec":{{"name":"{pkg}","version":"{ver}}}}}}}"#,
-                    )),
+                    .set_body_string(
+                        serde_json::json!({
+                            "name": pkg,
+                            "version": ver,
+                            "archive_url": format!("https://upstream/pub/{pkg}/{ver}.tar.gz"),
+                            "archive_sha256": "def",
+                            "pubspec": {"name": pkg, "version": ver},
+                        })
+                        .to_string(),
+                    ),
             )
             .mount(&mock_server)
             .await;
