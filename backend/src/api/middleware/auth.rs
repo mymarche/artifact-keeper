@@ -186,15 +186,9 @@ impl From<User> for AuthExtension {
 #[allow(clippy::result_large_err)]
 pub fn require_auth_basic(
     auth: Option<AuthExtension>,
-    realm: &str,
+    _realm: &str,
 ) -> std::result::Result<AuthExtension, Response> {
-    auth.ok_or_else(|| {
-        Response::builder()
-            .status(StatusCode::UNAUTHORIZED)
-            .header("WWW-Authenticate", format!("Basic realm=\"{}\"", realm))
-            .body(axum::body::Body::from("Authentication required"))
-            .unwrap()
-    })
+    auth.ok_or_else(unauthorized_response)
 }
 
 /// Like [`require_auth_basic`] but additionally enforces the given API-token

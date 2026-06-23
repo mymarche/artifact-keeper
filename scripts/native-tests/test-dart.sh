@@ -83,7 +83,7 @@ echo "==> [2/5] Step 1: GET upload URL..."
 STEP1_RESP=$(curl -s -w "\n---HTTP_STATUS:%{http_code}---" \
   -u "$ADMIN_USER:$ADMIN_PASS" \
   -H "Accept: application/vnd.pub.v2+json" \
-  -X POST \
+  -X GET \
   "$REGISTRY_URL/pub/$PUB_REPO_KEY/api/packages/versions/new")
 
 STEP1_STATUS=$(echo "$STEP1_RESP" | grep -o 'HTTP_STATUS:[0-9]*' | cut -d: -f2)
@@ -109,7 +109,7 @@ echo "  Upload URL: $UPLOAD_URL"
 # ---- Step 2: Upload package (multipart) ----
 echo ""
 echo "==> [3/5] Step 2: POST multipart upload..."
-FULL_UPLOAD_URL="$REGISTRY_URL$UPLOAD_URL"
+FULL_UPLOAD_URL="$UPLOAD_URL"
 echo "  Full URL: $FULL_UPLOAD_URL"
 
 STEP2_RESP=$(curl -s -w "\n---HTTP_STATUS:%{http_code}---\n---HEADERS---" \
@@ -207,6 +207,7 @@ fi
 echo ""
 echo "==> [5/5] Verifying package info..."
 QUERY_RESP=$(curl -s -w "\n---HTTP_STATUS:%{http_code}---" \
+  -u "$ADMIN_USER:$ADMIN_PASS" \
   -H "Accept: application/vnd.pub.v2+json" \
   "$REGISTRY_URL/pub/$PUB_REPO_KEY/api/packages/$PKG_NAME")
 
@@ -222,6 +223,62 @@ else
   echo "  ❌ Package query failed: $QUERY_STATUS"
 fi
 
+# ---- Step 5: Download archive ----
+echo ""
+echo "==> [6/7] Downloading archive via curl..."
+
+# Get archive URL and expected SHA256 from package info
+ARCHIVE_URL=$(echo "$QUERY_BODY" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print(d['latest']['archive_url'])
+" 2>/dev/null || true)
+EXPECTED_SHA256=$(echo "$QUERY_BODY" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print(d['latest'].get('archive_sha256',''))
+" 2>/dev/null || true)
+echo "  Archive URL: $ARCHIVE_URL"
+echo "  Expected SHA256: $EXPECTED_SHA256"
+DOWNLOAD_FILE="$WORK_DIR/downloaded-$PKG_NAME-$PKG_VERSION.tar.gz"
+
+DOWNLOAD_RESP=$(curl -s -w "\n---HTTP_STATUS:%{http_code}---" \
+  -u "$ADMIN_USER:$ADMIN_PASS" \
+  -o "$DOWNLOAD_FILE" \
+  "$ARCHIVE_URL")
+
+DOWNLOAD_STATUS=$(echo "$DOWNLOAD_RESP" | grep -o 'HTTP_STATUS:[0-9]*' | cut -d: -f2)
+
+echo "  URL:    $ARCHIVE_URL"
+echo "  Status: $DOWNLOAD_STATUS"
+
+if [ "$DOWNLOAD_STATUS" = "200" ]; then
+  DOWNLOAD_SIZE=$(stat -f%z "$DOWNLOAD_FILE" 2>/dev/null || stat -c%s "$DOWNLOAD_FILE" 2>/dev/null || echo "?")
+  echo "  Size:   $DOWNLOAD_SIZE bytes"
+
+  # Verify SHA256
+  ACTUAL_SHA256=$(shasum -a 256 "$DOWNLOAD_FILE" 2>/dev/null | cut -d' ' -f1 || sha256sum "$DOWNLOAD_FILE" 2>/dev/null | cut -d' ' -f1)
+  echo "  Actual SHA256:   $ACTUAL_SHA256"
+  if [ -n "$EXPECTED_SHA256" ] && [ "$EXPECTED_SHA256" = "$ACTUAL_SHA256" ]; then
+    echo "  ✅ SHA256 matches"
+  elif [ -n "$EXPECTED_SHA256" ]; then
+    echo "  ❌ SHA256 mismatch: expected $EXPECTED_SHA256, got $ACTUAL_SHA256"
+  else
+    echo "  ⚠️  No SHA256 in package info to compare"
+  fi
+
+  # Verify it's a valid tar.gz
+  if tar tzf "$DOWNLOAD_FILE" >/dev/null 2>&1; then
+    echo "  ✅ Archive is valid tar.gz"
+    echo "  Contents:"
+    tar tzf "$DOWNLOAD_FILE" | head -10
+  else
+    echo "  ❌ Downloaded file is not a valid tar.gz"
+  fi
+else
+  echo "  ❌ Download failed: $DOWNLOAD_STATUS"
+fi
+
 # ---- Summary ----
 echo ""
 echo "=============================================="
@@ -231,12 +288,14 @@ echo "Step 1 (get URL):     $STEP1_STATUS"
 echo "Step 2 (upload):      $STEP2_STATUS"
 echo "Step 3 (finalize):    $STEP3_STATUS"
 echo "Step 4 (query):       $QUERY_STATUS"
+echo "Step 5 (download):    $DOWNLOAD_STATUS"
 echo ""
 
 ALL_OK=true
 [ "$STEP1_STATUS" = "200" ] || ALL_OK=false
 [ "$STEP3_STATUS" = "200" ] || ALL_OK=false
 [ "$QUERY_STATUS" = "200" ] || ALL_OK=false
+[ "$DOWNLOAD_STATUS" = "200" ] || ALL_OK=false
 
 if $ALL_OK && [ "$STEP2_STATUS" = "204" -o "$STEP2_STATUS" = "200" ]; then
   echo "✅ curl protocol test PASSED"
@@ -311,8 +370,9 @@ http {
         ssl_certificate_key /certs/key.pem;
         location / {
             proxy_pass http://host.docker.internal:8080;
-            proxy_set_header Host \$host;
+            proxy_set_header Host \$http_host;
             proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-Proto \$scheme;
         }
     }
 }
@@ -352,8 +412,6 @@ else
       dart pub publish --force --skip-validation 2>&1
     "
   DART_EXIT=$?
-
-  docker stop "$NGINX_CID" >/dev/null 2>&1 || true
 fi
 
 if [ "$DART_EXIT" -eq 0 ]; then
@@ -362,17 +420,57 @@ else
   echo "❌ dart pub publish failed (exit code: $DART_EXIT)"
 fi
 
-# Verify package is still queryable after dart publish
+# ---- Verify and download via dart pub get ----
 echo ""
-echo "==> Verifying package after dart publish..."
-VERIFY_RESP=$(curl -s -w "\n---HTTP_STATUS:%{http_code}---" \
-  -H "Accept: application/vnd.pub.v2+json" \
-  "$REGISTRY_URL/pub/$PUB_REPO_KEY/api/packages/$PKG_NAME")
-VERIFY_STATUS=$(echo "$VERIFY_RESP" | grep -o 'HTTP_STATUS:[0-9]*' | cut -d: -f2)
-echo "  Package query status: $VERIFY_STATUS"
+echo "==> Verifying and downloading via dart pub get..."
 
-if [ "$VERIFY_STATUS" = "200" ]; then
-  echo "✅ Package queryable after dart publish"
+if [ -n "${NGINX_CID:-}" ]; then
+  # Create a consumer project that depends on the published package
+  CONSUMER_DIR="$WORK_DIR/consumer"
+  mkdir -p "$CONSUMER_DIR/lib"
+  cat > "$CONSUMER_DIR/pubspec.yaml" << EOF
+name: test_consumer
+environment:
+    sdk: ">=2.15.0 <4.0.0"
+dependencies:
+  $PKG_NAME:
+    hosted: https://$HOST_IP:9443/pub/$PUB_REPO_KEY
+    version: $DART_PKG_VERSION
+EOF
+  cat > "$CONSUMER_DIR/lib/consumer.dart" << EOF
+import 'package:$PKG_NAME/$PKG_NAME.dart';
+String use() => hello();
+EOF
+
+  docker run --rm \
+    --add-host=host.docker.internal:host-gateway \
+    -v "$CERT_DIR/cert.pem:/certs/self-signed.crt:ro" \
+    -v "$CONSUMER_DIR:/project" \
+    -w /project \
+    -e ADMIN_USER="$ADMIN_USER" \
+    -e ADMIN_PASS="$ADMIN_PASS" \
+    -e DART_HOST="$HOST_IP" \
+    dart:stable \
+    sh -c "
+      cp /certs/self-signed.crt /usr/local/share/ca-certificates/self-signed.crt 2>/dev/null || \
+        cp /certs/self-signed.crt /usr/lib/ssl/certs/self-signed.crt 2>/dev/null || \
+        mkdir -p /etc/ssl/certs && cp /certs/self-signed.crt /etc/ssl/certs/self-signed.crt
+      update-ca-certificates 2>/dev/null || true
+      printf '%s\n' '$(echo -n "$ADMIN_USER:$ADMIN_PASS" | base64)' | dart pub token add 'https://$HOST_IP:9443/pub/$PUB_REPO_KEY/'
+      echo '==> Running dart pub get...'
+      dart pub get 2>&1
+      echo ''
+      echo '==> Resolved packages:'
+      cat .dart_tool/package_config.json 2>/dev/null | grep -A2 \"$PKG_NAME\" || true
+    "
+  DART_DL_EXIT=$?
+  if [ "$DART_DL_EXIT" -eq 0 ]; then
+    echo "✅ dart pub get PASSED"
+  else
+    echo "❌ dart pub get FAILED (exit code: $DART_DL_EXIT)"
+  fi
+
+  docker stop "$NGINX_CID" >/dev/null 2>&1 || true
 else
-  echo "⚠️  Package query returned $VERIFY_STATUS"
+  echo "  ⚠️  nginx not running, skipping Dart download test"
 fi

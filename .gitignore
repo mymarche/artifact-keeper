@@ -19,6 +19,7 @@ backend/src/grpc/generated/*.bin
 # IDE
 .idea/
 .vscode/
+.opencode/
 *.swp
 *.swo
 *~

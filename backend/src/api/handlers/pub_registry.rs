@@ -7,7 +7,7 @@
 //!   GET  /pub/{repo_key}/api/packages/{name}                       - Package info
 //!   GET  /pub/{repo_key}/api/packages/{name}/versions/{version}    - Version info
 //!   GET  /pub/{repo_key}/packages/{name}/versions/{version}.tar.gz - Download archive
-//!   POST /pub/{repo_key}/api/packages/versions/new                 - Get upload URL
+//!   GET  /pub/{repo_key}/api/packages/versions/new                 - Get upload URL
 //!   POST /pub/{repo_key}/api/packages/versions/newUpload           - Upload package
 //!   GET  /pub/{repo_key}/api/packages/versions/newUploadFinish     - Finalize upload
 
@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
+use crate::api::extractors::RequestBaseUrl;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
@@ -36,7 +37,7 @@ pub fn router() -> Router<SharedState> {
     Router::new()
         // Upload flow (must be registered before the parameterized routes
         // so that literal segments match before `:name` captures them)
-        .route("/:repo_key/api/packages/versions/new", post(new_upload_url))
+        .route("/:repo_key/api/packages/versions/new", get(new_upload_url))
         .route(
             "/:repo_key/api/packages/versions/newUpload",
             post(upload_package),
@@ -71,6 +72,7 @@ async fn resolve_pub_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
 async fn package_info(
     State(state): State<SharedState>,
     Path((repo_key, name)): Path<(String, String)>,
+    base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
     let repo = resolve_pub_repo(&state.db, &repo_key).await?;
 
@@ -99,7 +101,11 @@ async fn package_info(
     })?;
 
     if artifacts.is_empty() {
-        return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
+        return Err(pub_error_response(
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            "Package not found",
+        ));
     }
 
     let versions: Vec<serde_json::Value> = artifacts
@@ -107,8 +113,11 @@ async fn package_info(
         .map(|a| {
             let version = a.version.clone().unwrap_or_default();
             let archive_url = format!(
-                "/pub/{}/packages/{}/versions/{}.tar.gz",
-                repo_key, name, version
+                "{}/pub/{}/packages/{}/versions/{}.tar.gz",
+                base_url.as_str(),
+                repo_key,
+                name,
+                version
             );
 
             let pubspec = a
@@ -126,6 +135,7 @@ async fn package_info(
             serde_json::json!({
                 "version": version,
                 "archive_url": archive_url,
+                "archive_sha256": a.checksum_sha256,
                 "pubspec": pubspec,
             })
         })
@@ -153,6 +163,7 @@ async fn package_info(
 async fn version_info(
     State(state): State<SharedState>,
     Path((repo_key, name, version)): Path<(String, String, String)>,
+    base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
     let repo = resolve_pub_repo(&state.db, &repo_key).await?;
 
@@ -185,8 +196,11 @@ async fn version_info(
 
     let ver = artifact.version.clone().unwrap_or_default();
     let archive_url = format!(
-        "/pub/{}/packages/{}/versions/{}.tar.gz",
-        repo_key, name, ver
+        "{}/pub/{}/packages/{}/versions/{}.tar.gz",
+        base_url.as_str(),
+        repo_key,
+        name,
+        ver
     );
 
     let pubspec = artifact
@@ -230,22 +244,22 @@ async fn download_archive(
     // Parse: {name}/versions/{version}.tar.gz
     let parts: Vec<&str> = archive_path.splitn(3, '/').collect();
     if parts.len() < 3 || parts[1] != "versions" {
-        return Err((
+        return Err(pub_error_response(
             StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
             "Invalid archive path: expected packages/{name}/versions/{version}.tar.gz",
-        )
-            .into_response());
+        ));
     }
 
     let pkg_name = parts[0];
     let version_file = parts[2];
 
     let version = version_file.strip_suffix(".tar.gz").ok_or_else(|| {
-        (
+        pub_error_response(
             StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
             "Invalid archive path: expected .tar.gz extension",
         )
-            .into_response()
     })?;
 
     let artifact = sqlx::query!(
@@ -271,7 +285,13 @@ async fn download_archive(
         )
             .into_response()
     })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Package archive not found").into_response());
+    .ok_or_else(|| {
+        pub_error_response(
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            "Package archive not found",
+        )
+    });
 
     let artifact = match artifact {
         Ok(a) => a,
@@ -378,18 +398,23 @@ async fn download_archive(
 }
 
 // ---------------------------------------------------------------------------
-// POST /pub/{repo_key}/api/packages/versions/new -- Get upload URL
+// GET /pub/{repo_key}/api/packages/versions/new -- Get upload URL
 // ---------------------------------------------------------------------------
 
 async fn new_upload_url(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
+    base_url: RequestBaseUrl,
 ) -> Result<Response, Response> {
     let _user_id = require_auth_basic(auth, "pub")?.user_id;
     let _repo = resolve_pub_repo(&state.db, &repo_key).await?;
 
-    let upload_url = format!("/pub/{}/api/packages/versions/newUpload", repo_key);
+    let upload_url = format!(
+        "{}/pub/{}/api/packages/versions/newUpload",
+        base_url.as_str(),
+        repo_key
+    );
     let json = serde_json::json!({
         "url": upload_url,
         "fields": {},
@@ -410,6 +435,7 @@ async fn upload_package(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
+    base_url: RequestBaseUrl,
     mut multipart: Multipart,
 ) -> Result<Response, Response> {
     let user_id = require_auth_basic(auth, "pub")?.user_id;
@@ -435,11 +461,19 @@ async fn upload_package(
     }
 
     let body = file_bytes.ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, "Missing 'file' field in upload").into_response()
+        pub_error_response(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "Missing 'file' field in upload",
+        )
     })?;
 
     if body.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "Empty package archive").into_response());
+        return Err(pub_error_response(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "Empty package archive",
+        ));
     }
 
     // Extract pubspec.yaml from the tar.gz archive
@@ -455,11 +489,11 @@ async fn upload_package(
     let pkg_version = &pubspec.version;
 
     if pkg_name.is_empty() || pkg_version.is_empty() {
-        return Err((
+        return Err(pub_error_response(
             StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
             "Package name and version are required",
-        )
-            .into_response());
+        ));
     }
 
     // Compute SHA256
@@ -487,7 +521,11 @@ async fn upload_package(
     })?;
 
     if existing.is_some() {
-        return Err((StatusCode::CONFLICT, "Package version already exists").into_response());
+        return Err(pub_error_response(
+            StatusCode::CONFLICT,
+            "CONFLICT",
+            "Package version already exists",
+        ));
     }
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
@@ -569,11 +607,15 @@ async fn upload_package(
         pkg_name, pkg_version, filename, repo_key
     );
 
-    // Redirect to finalize endpoint per the Pub spec
-    let finish_url = format!("/pub/{}/api/packages/versions/newUploadFinish", repo_key);
+    // 204 with Location per the Pub spec
+    let finish_url = format!(
+        "{}/pub/{}/api/packages/versions/newUploadFinish",
+        base_url.as_str().trim_end_matches('/'),
+        repo_key
+    );
 
     Ok(Response::builder()
-        .status(StatusCode::FOUND)
+        .status(StatusCode::NO_CONTENT)
         .header("Location", finish_url)
         .body(Body::empty())
         .unwrap())
@@ -603,6 +645,22 @@ async fn finalize_upload(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Build a Pub-spec JSON error response: `{"error": {"code": "...", "message": "..."}}`
+#[allow(clippy::result_large_err)]
+fn pub_error_response(status: StatusCode, code: &str, message: &str) -> Response {
+    let json = serde_json::json!({
+        "error": {
+            "code": code,
+            "message": message,
+        }
+    });
+    Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "application/vnd.pub.v2+json")
+        .body(Body::from(serde_json::to_string(&json).unwrap()))
+        .unwrap()
+}
 
 /// Extract pubspec.yaml from a Pub package tar.gz archive.
 fn extract_pubspec_from_archive(data: &[u8]) -> Result<crate::formats::r#pub::PubSpec, String> {
@@ -731,5 +789,133 @@ mod tests {
     fn test_extract_pubspec_from_invalid_archive() {
         let result = extract_pubspec_from_archive(b"not a valid gzip archive");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pub_error_response_format() {
+        let resp = pub_error_response(StatusCode::NOT_FOUND, "NOT_FOUND", "Package not found");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let ct = resp.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap();
+        assert_eq!(ct, "application/vnd.pub.v2+json");
+    }
+
+    #[test]
+    fn test_pub_error_response_json_body() {
+        use futures::FutureExt;
+        let resp = pub_error_response(StatusCode::CONFLICT, "CONFLICT", "Already exists");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "CONFLICT");
+        assert_eq!(json["error"]["message"], "Already exists");
+    }
+
+    #[tokio::test]
+    async fn test_new_upload_url_get_returns_200() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use tower::ServiceExt;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "pub").await else {
+            return;
+        };
+        let app = fixture.router_with_auth(super::router());
+
+        let req = tdh::get(format!("/{}/api/packages/versions/new", fixture.repo_key));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ct = resp.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap();
+        assert_eq!(ct, "application/vnd.pub.v2+json");
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("url").is_some());
+        assert!(json.get("fields").is_some());
+
+        fixture.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_new_upload_url_post_returns_405() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use tower::ServiceExt;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "pub").await else {
+            return;
+        };
+        let app = fixture.router_with_auth(super::router());
+
+        let req = tdh::post(
+            format!("/{}/api/packages/versions/new", fixture.repo_key),
+            "application/json",
+            bytes::Bytes::new(),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        fixture.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_package_info_includes_archive_sha256() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use tower::ServiceExt;
+
+        let Some(fixture) = tdh::Fixture::setup("local", "pub").await else {
+            return;
+        };
+
+        // Create a minimal pub package tar.gz
+        let pubspec_yaml = "name: test_pkg\nversion: 1.0.0\n";
+        let mut tar_data = Vec::new();
+        {
+            use flate2::write::GzEncoder;
+            use flate2::Compression;
+            use tar::Builder as TarBuilder;
+
+            let encoder = GzEncoder::new(&mut tar_data, Compression::default());
+            let mut tar = TarBuilder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            tar.append_data(&mut header, "pubspec.yaml", pubspec_yaml.as_bytes())
+                .unwrap();
+            let encoder = tar.into_inner().unwrap();
+            encoder.finish().unwrap();
+        }
+
+        // Seed artifact
+        let storage_key = "pub/test_pkg/1.0.0/test_pkg-1.0.0.tar.gz".to_string();
+        tdh::seed_artifact(
+            &fixture.state,
+            &fixture.pool,
+            &fixture.repo_info("local", None),
+            &storage_key,
+            "test_pkg/1.0.0/test_pkg-1.0.0.tar.gz",
+            "test_pkg",
+            "1.0.0",
+            "application/gzip",
+            bytes::Bytes::from(tar_data),
+            fixture.user_id,
+        )
+        .await;
+
+        let app = fixture.router_with_auth(super::router());
+        let req = tdh::get(format!("/{}/api/packages/test_pkg", fixture.repo_key));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let versions = json["versions"].as_array().unwrap();
+        assert!(!versions.is_empty());
+        assert!(versions[0].get("archive_sha256").is_some());
+
+        fixture.teardown().await;
     }
 }
