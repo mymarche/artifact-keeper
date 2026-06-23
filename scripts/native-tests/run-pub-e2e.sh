@@ -90,7 +90,7 @@ REGISTRY_URL="$REGISTRY_URL" \
 PUB_REPO_KEY="$PUB_REPO_KEY" \
 ADMIN_USER="$ADMIN_USER" \
 ADMIN_PASS="$ADMIN_PASS" \
-  bash "$SCRIPT_DIR/test-dart.sh"
+  bash "$SCRIPT_DIR/test-pub.sh"
 TEST_EXIT=$?
 
 echo ""
