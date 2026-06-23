@@ -119,7 +119,16 @@ async fn package_info(
         if repo.repo_type == RepositoryType::Remote {
             if let Some(ref upstream_url) = repo.upstream_url {
                 let api_path = format!("api/packages/{}", name);
-                if let Some(resp) = proxy_pub_meta_get(upstream_url, &api_path).await {
+                if let Some(resp) = proxy_pub_meta_get(
+                    &state,
+                    repo.id,
+                    &repo_key,
+                    base_url.as_str(),
+                    upstream_url,
+                    &api_path,
+                )
+                .await
+                {
                     return Ok(resp);
                 }
             }
@@ -189,7 +198,16 @@ async fn package_info(
                     RepositoryType::Remote => {
                         if let Some(ref upstream_url) = member.upstream_url {
                             let api_path = format!("api/packages/{}", name);
-                            if let Some(resp) = proxy_pub_meta_get(upstream_url, &api_path).await {
+                            if let Some(resp) = proxy_pub_meta_get(
+                                &state,
+                                member.id,
+                                &repo_key,
+                                base_url.as_str(),
+                                upstream_url,
+                                &api_path,
+                            )
+                            .await
+                            {
                                 return Ok(resp);
                             }
                         }
@@ -282,7 +300,16 @@ async fn version_info(
             if repo.repo_type == RepositoryType::Remote {
                 if let Some(ref upstream_url) = repo.upstream_url {
                     let api_path = format!("api/packages/{}/versions/{}", name, version);
-                    if let Some(resp) = proxy_pub_meta_get(upstream_url, &api_path).await {
+                    if let Some(resp) = proxy_pub_meta_get(
+                        &state,
+                        repo.id,
+                        &repo_key,
+                        base_url.as_str(),
+                        upstream_url,
+                        &api_path,
+                    )
+                    .await
+                    {
                         return Ok(resp);
                     }
                 }
@@ -351,8 +378,15 @@ async fn version_info(
                             if let Some(ref upstream_url) = member.upstream_url {
                                 let api_path =
                                     format!("api/packages/{}/versions/{}", name, version);
-                                if let Some(resp) =
-                                    proxy_pub_meta_get(upstream_url, &api_path).await
+                                if let Some(resp) = proxy_pub_meta_get(
+                                    &state,
+                                    member.id,
+                                    &repo_key,
+                                    base_url.as_str(),
+                                    upstream_url,
+                                    &api_path,
+                                )
+                                .await
                                 {
                                     return Ok(resp);
                                 }
@@ -866,57 +900,105 @@ fn build_pub_version_response(
         .unwrap()
 }
 
+/// Rewrite `archive_url` in proxied Pub metadata JSON to point to AK.
+///
+/// Handles both `package_info` (has `versions[]` array) and `version_info`
+/// (flat structure with root `archive_url`). Non-URL fields are preserved.
+fn rewrite_pub_archive_urls(json: &mut serde_json::Value, base_url: &str, repo_key: &str) {
+    let name = json
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("_unknown")
+        .to_string();
+
+    if let Some(versions) = json.get_mut("versions").and_then(|v| v.as_array_mut()) {
+        for entry in versions.iter_mut() {
+            rewrite_pub_entry_archive_url(entry, base_url, repo_key, &name);
+        }
+    }
+
+    rewrite_pub_entry_archive_url(json, base_url, repo_key, &name);
+}
+
+fn rewrite_pub_entry_archive_url(
+    entry: &mut serde_json::Value,
+    base_url: &str,
+    repo_key: &str,
+    name: &str,
+) {
+    let ver = entry
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if let Some(obj) = entry.as_object_mut() {
+        let new_url = format!(
+            "{}/pub/{}/packages/{}/versions/{}.tar.gz",
+            base_url, repo_key, name, ver
+        );
+        obj.insert(
+            "archive_url".to_string(),
+            serde_json::Value::String(new_url),
+        );
+    }
+}
+
 /// Forward a GET request to the upstream Pub registry for package metadata.
 ///
-/// Returns the upstream status + body verbatim. On any transport error (DNS,
-/// TLS, timeout) returns `None` so the caller can fall through to other
+/// Uses `proxy_fetch` (via `ProxyService`) for caching, single-flight
+/// coordination, and stale-if-error fallback. Rewrites `archive_url` in the
+/// JSON response to point to Artifact Keeper's download endpoint.
+///
+/// Returns `None` on transport errors so the caller can fall through to other
 /// resolution strategies.
-async fn proxy_pub_meta_get(upstream_url: &str, api_path: &str) -> Option<Response> {
-    let base = upstream_url.trim_end_matches('/');
-    let url = format!("{}/{}", base, api_path.trim_start_matches('/'));
-    let client = crate::services::http_client::default_client();
+async fn proxy_pub_meta_get(
+    state: &SharedState,
+    repo_id: Uuid,
+    repo_key: &str,
+    base_url: &str,
+    upstream_url: &str,
+    api_path: &str,
+) -> Option<Response> {
+    let proxy = state.proxy_service.as_ref()?;
 
-    let resp = match client.get(&url).send().await {
-        Ok(r) => r,
-        Err(err) => {
-            tracing::debug!(
-                target: "pub_meta",
-                upstream = %url,
-                error = %err,
-                "Pub meta GET upstream unreachable"
+    let result = proxy_helpers::proxy_fetch(proxy, repo_id, repo_key, upstream_url, api_path).await;
+
+    let (content, content_type) = match result {
+        Ok((c, ct)) => (c, ct),
+        Err(_) => return None,
+    };
+
+    let ct = content_type
+        .as_deref()
+        .unwrap_or("application/vnd.pub.v2+json");
+
+    let mut json = match serde_json::from_slice::<serde_json::Value>(&content) {
+        Ok(j) => j,
+        Err(_) => {
+            // Non-JSON response — pass through verbatim
+            return Some(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, ct)
+                    .body(Body::from(content))
+                    .unwrap_or_else(|_| {
+                        (StatusCode::INTERNAL_SERVER_ERROR, "upstream error").into_response()
+                    }),
             );
-            return None;
         }
     };
 
-    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let content_type = resp
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/vnd.pub.v2+json")
-        .to_string();
+    rewrite_pub_archive_urls(&mut json, base_url, repo_key);
 
-    match resp.bytes().await {
-        Ok(bytes) => Some(
-            Response::builder()
-                .status(status)
-                .header(CONTENT_TYPE, content_type)
-                .body(Body::from(bytes))
-                .unwrap_or_else(|_| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "upstream error").into_response()
-                }),
-        ),
-        Err(err) => {
-            tracing::debug!(
-                target: "pub_meta",
-                upstream = %url,
-                error = %err,
-                "Pub meta GET failed to read upstream body"
-            );
-            None
-        }
-    }
+    Some(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, ct)
+            .body(Body::from(serde_json::to_string(&json).unwrap()))
+            .unwrap_or_else(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, "rewrite error").into_response()
+            }),
+    )
 }
 
 /// Extract pubspec.yaml from a Pub package tar.gz archive.
@@ -1253,8 +1335,77 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Remote repo proxy integration tests
+    // rewrite_pub_archive_urls unit tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rewrite_pub_archive_urls_package_info() {
+        let mut json = serde_json::json!({
+            "name": "test_pkg",
+            "latest": {"version": "1.0.0"},
+            "versions": [
+                {"version": "1.0.0", "archive_url": "https://upstream/pub/test_pkg/1.0.0.tar.gz", "archive_sha256": "abc", "pubspec": {}},
+                {"version": "2.0.0", "archive_url": "https://upstream/pub/test_pkg/2.0.0.tar.gz", "archive_sha256": "def", "pubspec": {}}
+            ]
+        });
+        let base_url = "https://ak.example.com";
+        let repo_key = "pub-remote";
+
+        rewrite_pub_archive_urls(&mut json, base_url, repo_key);
+
+        let versions = json["versions"].as_array().unwrap();
+        assert_eq!(
+            versions[0]["archive_url"],
+            format!(
+                "{}/pub/{}/packages/test_pkg/versions/1.0.0.tar.gz",
+                base_url, repo_key
+            )
+        );
+        assert_eq!(
+            versions[1]["archive_url"],
+            format!(
+                "{}/pub/{}/packages/test_pkg/versions/2.0.0.tar.gz",
+                base_url, repo_key
+            )
+        );
+        // Non-URL fields preserved
+        assert_eq!(versions[0]["archive_sha256"], "abc");
+        assert_eq!(versions[0]["version"], "1.0.0");
+    }
+
+    #[test]
+    fn test_rewrite_pub_archive_urls_version_info() {
+        let mut json = serde_json::json!({
+            "name": "test_pkg",
+            "version": "3.0.0",
+            "archive_url": "https://upstream/pub/test_pkg/3.0.0.tar.gz",
+            "archive_sha256": "xyz",
+            "pubspec": {"name": "test_pkg", "version": "3.0.0"}
+        });
+
+        rewrite_pub_archive_urls(&mut json, "https://ak.example.com", "pub-remote");
+
+        assert_eq!(
+            json["archive_url"],
+            "https://ak.example.com/pub/pub-remote/packages/test_pkg/versions/3.0.0.tar.gz"
+        );
+        // Non-URL fields preserved
+        assert_eq!(json["archive_sha256"], "xyz");
+        assert_eq!(json["version"], "3.0.0");
+    }
+
+    #[test]
+    fn test_rewrite_pub_archive_urls_missing_fields() {
+        // Missing name and archive_url — should not panic
+        let mut json = serde_json::json!({
+            "versions": [
+                {"version": "1.0.0"}
+            ]
+        });
+        rewrite_pub_archive_urls(&mut json, "https://ak.example.com", "pub-remote");
+        // Should not have added archive_url (no name to construct from)
+        assert!(json["versions"][0].get("archive_url").is_some());
+    }
 
     fn mock_pub_package_info(name: &str) -> String {
         format!(
@@ -1294,7 +1445,11 @@ mod tests {
             .await
             .expect("update upstream_url");
 
-        let app = tdh::router_anon(super::router(), fx.state.clone());
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+        let app = tdh::router_anon(super::router(), state);
         let uri = format!("/{}/api/packages/{}", fx.repo_key, pkg);
         let (status, bytes) = tdh::send(app, tdh::get(uri)).await;
         fx.teardown().await;
@@ -1303,6 +1458,16 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["name"], pkg);
         assert_eq!(json["versions"][0]["version"], "1.0.0");
+        // Verify archive_url is rewritten to AK format, not upstream
+        let url = json["versions"][0]["archive_url"].as_str().unwrap();
+        assert!(
+            url.contains(&format!(
+                "/pub/{}/packages/{}/versions/1.0.0.tar.gz",
+                fx.repo_key, pkg
+            )),
+            "archive_url should be rewritten to AK format, got: {}",
+            url
+        );
     }
 
     #[tokio::test]
@@ -1314,7 +1479,11 @@ mod tests {
         };
 
         // Leave upstream_url pointing to a non-existent server
-        let app = tdh::router_anon(super::router(), fx.state.clone());
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+        let app = tdh::router_anon(super::router(), state);
         let uri = format!("/{}/api/packages/missing_pkg", fx.repo_key);
         let (status, _bytes) = tdh::send(app, tdh::get(uri)).await;
         fx.teardown().await;
@@ -1357,7 +1526,11 @@ mod tests {
             .await
             .expect("update upstream_url");
 
-        let app = tdh::router_anon(super::router(), fx.state.clone());
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+        let app = tdh::router_anon(super::router(), state);
         let uri = format!("/{}/api/packages/{}/versions/{}", fx.repo_key, pkg, ver);
         let (status, bytes) = tdh::send(app, tdh::get(uri)).await;
         fx.teardown().await;
@@ -1366,6 +1539,16 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["name"], pkg);
         assert_eq!(json["version"], ver);
+        // Verify archive_url is rewritten to AK format
+        let url = json["archive_url"].as_str().unwrap();
+        assert!(
+            url.contains(&format!(
+                "/pub/{}/packages/{}/versions/{}.tar.gz",
+                fx.repo_key, pkg, ver
+            )),
+            "archive_url should be rewritten to AK format, got: {}",
+            url
+        );
     }
 
     // -----------------------------------------------------------------------
