@@ -3956,6 +3956,8 @@ pub async fn serve_local_artifact(
     storage_key: &str,
     content_type: &str,
     content_disposition_filename: Option<&str>,
+    ip_address: Option<&str>,
+    user_agent: Option<&str>,
 ) -> Result<Response, Response> {
     let storage = state
         .storage_for_repo(&repo.storage_location())
@@ -3970,12 +3972,18 @@ pub async fn serve_local_artifact(
         .await
         .map_err(|e| internal_error("Storage", e))?;
 
-    let _ = sqlx::query(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-    )
-    .bind(artifact_id)
-    .execute(&state.db)
-    .await;
+    state.download_tracker.record_download(
+        Some(artifact_id),
+        None,
+        None,
+        ip_address.unwrap_or("0.0.0.0"),
+        user_agent,
+        crate::services::download_tracker::DownloadSource::Proxy,
+        None,
+        None,
+        None,
+        None,
+    ).await;
 
     Ok(build_download_response(
         content,
@@ -7213,6 +7221,8 @@ mod tests {
             "cran/foo/1.0/foo.tar.gz",
             "application/gzip",
             Some("foo.tar.gz"),
+            None,
+            None,
         )
         .await
         .expect("serve");

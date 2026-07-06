@@ -23,8 +23,10 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
+use crate::api::extractors::{ClientIp, UserAgent};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
+use crate::services::download_tracker::DownloadSource;
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
 use crate::services::signing_service::SigningService;
@@ -508,6 +510,8 @@ async fn download_package(
         String,
         String,
     )>,
+    client_ip: ClientIp,
+    user_agent: UserAgent,
 ) -> Result<Response, Response> {
     if !filename.ends_with(".apk") {
         return Err((StatusCode::BAD_REQUEST, "File must have .apk extension").into_response());
@@ -598,13 +602,18 @@ async fn download_package(
 
     match storage.get_stream(&artifact.storage_key).await {
         Ok(stream) => {
-            // Record download
-            let _ = sqlx::query!(
-                "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-                artifact.id
-            )
-            .execute(&state.db)
-            .await;
+            state.download_tracker.record_download(
+                Some(artifact.id),
+                None,
+                None,
+                client_ip.as_str(),
+                user_agent.as_str(),
+                DownloadSource::Proxy,
+                None,
+                None,
+                None,
+                None,
+            ).await;
 
             Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -630,12 +639,18 @@ async fn download_package(
             )
             .await?;
 
-            let _ = sqlx::query!(
-                "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-                artifact.id
-            )
-            .execute(&state.db)
-            .await;
+            state.download_tracker.record_download(
+                Some(artifact.id),
+                None,
+                None,
+                client_ip.as_str(),
+                user_agent.as_str(),
+                DownloadSource::Proxy,
+                None,
+                None,
+                None,
+                None,
+            ).await;
 
             Ok(Response::builder()
                 .status(StatusCode::OK)

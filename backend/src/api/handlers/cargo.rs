@@ -26,7 +26,8 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
-use crate::api::extractors::RequestBaseUrl;
+use crate::api::extractors::{ClientIp, RequestBaseUrl, UserAgent};
+use crate::services::download_tracker::DownloadSource;
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::{require_auth_with_bearer_fallback, AuthExtension};
@@ -820,6 +821,8 @@ async fn publish(
 async fn download(
     State(state): State<SharedState>,
     Path((repo_key, name, version)): Path<(String, String, String)>,
+    client_ip: ClientIp,
+    user_agent: UserAgent,
 ) -> Result<Response, Response> {
     let repo = resolve_cargo_repo(&state.db, &repo_key, &state.repo_cache).await?;
     let name_lower = name.to_lowercase();
@@ -998,13 +1001,18 @@ async fn download(
         .await
         .map_err(map_storage_err)?;
 
-    // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    state.download_tracker.record_download(
+        Some(artifact.id),
+        None,
+        None,
+        client_ip.as_str(),
+        user_agent.as_str(),
+        DownloadSource::Proxy,
+        None,
+        None,
+        None,
+        None,
+    ).await;
 
     let filename = format!("{}-{}.crate", name_lower, version);
 

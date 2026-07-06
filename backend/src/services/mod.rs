@@ -15,6 +15,7 @@ pub mod cache_invalidation;
 pub mod ci_oidc_service;
 pub mod cluster_lock;
 pub mod declared_dependencies;
+pub mod download_tracker;
 pub mod dependency_track_service;
 pub mod email_dispatcher;
 pub mod email_rate_limiter;

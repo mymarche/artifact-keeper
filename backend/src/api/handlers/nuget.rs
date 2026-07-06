@@ -25,7 +25,8 @@ use axum::Router;
 use sqlx::PgPool;
 use tracing::info;
 
-use crate::api::extractors::RequestBaseUrl;
+use crate::api::extractors::{ClientIp, RequestBaseUrl, UserAgent};
+use crate::services::download_tracker::DownloadSource;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
@@ -646,6 +647,8 @@ async fn flatcontainer_versions(
 async fn flatcontainer_download(
     State(state): State<SharedState>,
     Path((repo_key, package_id, version, filename)): Path<(String, String, String, String)>,
+    client_ip: ClientIp,
+    user_agent: UserAgent,
 ) -> Result<Response, Response> {
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
     let package_id_lower = package_id.to_lowercase();
@@ -817,13 +820,18 @@ async fn flatcontainer_download(
                 })?
         };
 
-    // Record download.
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    state.download_tracker.record_download(
+        Some(artifact.id),
+        None,
+        None,
+        client_ip.as_str(),
+        user_agent.as_str(),
+        DownloadSource::Proxy,
+        None,
+        None,
+        None,
+        None,
+    ).await;
 
     use futures::StreamExt as _;
     Ok(Response::builder()

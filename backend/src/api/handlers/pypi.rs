@@ -27,8 +27,10 @@ use sqlx::PgPool;
 use std::future::Future;
 use tracing::{debug, info, warn};
 
+use crate::api::extractors::{ClientIp, UserAgent};
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
+use crate::services::download_tracker::DownloadSource;
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
@@ -1216,6 +1218,8 @@ async fn download_or_metadata(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, project, filename)): Path<(String, String, String)>,
+    client_ip: ClientIp,
+    user_agent: UserAgent,
 ) -> Result<Response, Response> {
     let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
 
@@ -1233,7 +1237,7 @@ async fn download_or_metadata(
     }
 
     // Regular file download
-    serve_file(&state, &repo, &repo_key, &project, &filename, auth.as_ref()).await
+    serve_file(&state, &repo, &repo_key, &project, &filename, auth.as_ref(), client_ip.as_str(), user_agent.as_str()).await
 }
 
 fn pypi_lkg_filename_from_artifact_path(artifact_path: &str) -> String {
@@ -1456,6 +1460,8 @@ async fn serve_file(
     project: &str,
     filename: &str,
     auth: Option<&AuthExtension>,
+    client_ip: &str,
+    user_agent: Option<&str>,
 ) -> Result<Response, Response> {
     // Find artifact by filename (last path segment matches)
     let artifact = sqlx::query!(
@@ -1789,16 +1795,18 @@ async fn serve_file(
             .boxed()
     };
 
-    // Record download statistics for locally-stored artifacts only.
-    // Proxied and virtual-repo fetches go through
-    // build_streaming_file_response() which intentionally skips stats since
-    // the artifact is not ours.
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    state.download_tracker.record_download(
+        Some(artifact.id),
+        None,
+        None,
+        client_ip,
+        user_agent,
+        DownloadSource::Proxy,
+        None,
+        None,
+        None,
+        None,
+    ).await;
 
     Ok(Response::builder()
         .status(StatusCode::OK)

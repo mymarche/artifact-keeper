@@ -27,9 +27,11 @@ use sqlx::PgPool;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::api::extractors::{ClientIp, UserAgent};
 use crate::api::handlers::cache_headers;
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
+use crate::services::download_tracker::DownloadSource;
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::error::AppError;
@@ -823,6 +825,8 @@ async fn download(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, path)): Path<(String, String)>,
     headers: HeaderMap,
+    client_ip: ClientIp,
+    user_agent: UserAgent,
 ) -> Result<Response, Response> {
     let repo = resolve_maven_repo(&state.db, &repo_key).await?;
     let storage = state
@@ -997,7 +1001,7 @@ async fn download(
     }
 
     // 4. Serve the artifact file
-    serve_artifact(&state, &repo, &repo_key, &path, auth.as_ref()).await
+    serve_artifact(&state, &repo, &repo_key, &path, auth.as_ref(), client_ip.as_str(), user_agent.as_str()).await
 }
 
 /// Fetch a single Remote virtual member's Maven metadata document at `path`
@@ -1368,6 +1372,8 @@ async fn serve_artifact(
     repo_key: &str,
     path: &str,
     auth: Option<&AuthExtension>,
+    client_ip: &str,
+    user_agent: Option<&str>,
 ) -> Result<Response, Response> {
     // Remote (proxy) repos never persist rows in the `artifacts` table: the
     // proxy cache writes to the package catalog + filesystem only (guarded by
@@ -1635,13 +1641,18 @@ async fn serve_artifact(
         .await
         .map_err(map_storage_err)?;
 
-    // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    state.download_tracker.record_download(
+        Some(artifact.id),
+        None,
+        None,
+        client_ip,
+        user_agent,
+        DownloadSource::Proxy,
+        None,
+        None,
+        None,
+        None,
+    ).await;
 
     let ct = content_type_for_path(path);
     let mut builder = Response::builder()

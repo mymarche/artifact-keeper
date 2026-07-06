@@ -26,7 +26,8 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
-use crate::api::extractors::RequestBaseUrl;
+use crate::api::extractors::{ClientIp, RequestBaseUrl, UserAgent};
+use crate::services::download_tracker::DownloadSource;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
@@ -568,6 +569,8 @@ async fn upload_object(
 async fn download_object(
     State(state): State<SharedState>,
     Path((repo_key, oid)): Path<(String, String)>,
+    client_ip: ClientIp,
+    user_agent: UserAgent,
 ) -> Result<Response, Response> {
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
     validate_oid(&oid)?;
@@ -673,13 +676,18 @@ async fn download_object(
             )
         })?;
 
-    // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    state.download_tracker.record_download(
+        Some(artifact.id),
+        None,
+        None,
+        client_ip.as_str(),
+        user_agent.as_str(),
+        DownloadSource::Proxy,
+        None,
+        None,
+        None,
+        None,
+    ).await;
 
     Ok(Response::builder()
         .status(StatusCode::OK)

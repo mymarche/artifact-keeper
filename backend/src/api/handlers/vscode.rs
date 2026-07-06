@@ -21,9 +21,11 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
+use crate::api::extractors::{ClientIp, UserAgent};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
+use crate::services::download_tracker::DownloadSource;
 use crate::models::repository::RepositoryType;
 
 // ---------------------------------------------------------------------------
@@ -136,6 +138,8 @@ async fn query_extensions(
 async fn download_vsix(
     State(state): State<SharedState>,
     Path((repo_key, publisher, name, version)): Path<(String, String, String, String)>,
+    client_ip: ClientIp,
+    user_agent: UserAgent,
 ) -> Result<Response, Response> {
     let repo = resolve_vscode_repo(&state.db, &repo_key).await?;
 
@@ -240,12 +244,18 @@ async fn download_vsix(
                 .into_response()
         })?;
 
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    state.download_tracker.record_download(
+        Some(artifact.id),
+        None,
+        None,
+        client_ip.as_str(),
+        user_agent.as_str(),
+        DownloadSource::Proxy,
+        None,
+        None,
+        None,
+        None,
+    ).await;
 
     let filename = format!("{}.{}-{}.vsix", publisher, name, version);
 

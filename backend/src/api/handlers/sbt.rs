@@ -23,9 +23,11 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
+use crate::api::extractors::{ClientIp, UserAgent};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
+use crate::services::download_tracker::DownloadSource;
 use crate::formats::sbt::SbtHandler;
 use crate::models::repository::RepositoryType;
 
@@ -62,6 +64,8 @@ async fn resolve_sbt_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
 async fn download_by_path(
     State(state): State<SharedState>,
     Path((repo_key, artifact_path)): Path<(String, String)>,
+    client_ip: ClientIp,
+    user_agent: UserAgent,
 ) -> Result<Response, Response> {
     let repo = resolve_sbt_repo(&state.db, &repo_key).await?;
 
@@ -159,12 +163,18 @@ async fn download_by_path(
                 .into_response()
         })?;
 
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    state.download_tracker.record_download(
+        Some(artifact.id),
+        None,
+        None,
+        client_ip.as_str(),
+        user_agent.as_str(),
+        DownloadSource::Proxy,
+        None,
+        None,
+        None,
+        None,
+    ).await;
 
     let content_type = if artifact.content_type.is_empty() {
         "application/octet-stream"
