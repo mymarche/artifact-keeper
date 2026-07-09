@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::download_tracker::DownloadStatisticsItem;
 use crate::services::backup_service::{
     BackupService, BackupStatus, BackupType, CreateBackupRequest as ServiceCreateBackup,
     RestoreOptions,
@@ -34,6 +35,7 @@ pub fn router() -> Router<SharedState> {
         .route("/reindex", post(trigger_reindex))
         .route("/rescan-for-inventory", post(rescan_for_inventory))
         .route("/storage-backends", get(list_storage_backends))
+        .route("/downloads", get(list_downloads))
 }
 
 /// List available storage backends.
@@ -985,6 +987,42 @@ pub async fn rescan_for_inventory(
     ))
 )]
 pub struct AdminApiDoc;
+
+// ---------------------------------------------------------------------------
+// Admin download list
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct DownloadsQuery {
+    #[serde(default = "default_per_page")]
+    pub per_page: i64,
+}
+
+fn default_per_page() -> i64 {
+    20
+}
+
+/// List recent download statistics.
+#[utoipa::path(
+    get,
+    path = "/downloads",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    security(("bearer_auth" = [])),
+    params(
+        ("per_page" = i64, Query, description = "Number of items per page"),
+    ),
+    responses(
+        (status = 200, description = "Download statistics list"),
+    ),
+)]
+pub async fn list_downloads(
+    State(state): State<SharedState>,
+    Query(query): Query<DownloadsQuery>,
+) -> Result<Json<Vec<DownloadStatisticsItem>>> {
+    let items = state.download_tracker.list_downloads(query.per_page).await;
+    Ok(Json(items))
+}
 
 #[cfg(test)]
 mod tests {

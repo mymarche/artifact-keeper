@@ -249,6 +249,62 @@ pub fn request_scheme_is_https(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+/// Client IP address extracted from `X-Forwarded-For` header.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientIp(pub String);
+
+impl ClientIp {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[async_trait]
+impl<S> FromRequestParts<S> for ClientIp
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let ip = parts
+            .headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .unwrap_or("127.0.0.1")
+            .to_string();
+        Ok(Self(ip))
+    }
+}
+
+/// User-Agent header value extracted from the request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserAgent(pub Option<String>);
+
+impl UserAgent {
+    pub fn as_str(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+}
+
+#[async_trait]
+impl<S> FromRequestParts<S> for UserAgent
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let agent = parts
+            .headers
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        Ok(Self(agent))
+    }
+}
+
 #[allow(clippy::disallowed_methods)]
 // streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(test)]

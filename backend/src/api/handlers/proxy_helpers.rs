@@ -1822,16 +1822,27 @@ where
             ) {
                 VirtualMemberFetchStrategy::Local => {
                     match local_fetch(member.id, member.storage_location()).await {
-                        Ok(result) => (MemberCacheClass::DefiniteHit, Some(result)),
+                        Ok(mut result) => {
+                            result.member_id = Some(member.id);
+                            (MemberCacheClass::DefiniteHit, Some(result))
+                        }
                         Err(_) => (MemberCacheClass::DefiniteMiss, None),
                     }
                 }
                 VirtualMemberFetchStrategy::Proxy => match proxy_service {
                     // The cache-only probe contacts no upstream; its result is
                     // classified by the pure `classify_cache_probe`.
-                    Some(proxy) => classify_cache_probe(
-                        proxy.streaming_cached_artifact_by_path(member, path).await,
-                    ),
+                    Some(proxy) => {
+                        let (class, hit) = classify_cache_probe(
+                            proxy.streaming_cached_artifact_by_path(member, path).await,
+                        );
+                        if let Some(mut result) = hit {
+                            result.member_id = Some(member.id);
+                            (class, Some(result))
+                        } else {
+                            (class, None)
+                        }
+                    }
                     None => (MemberCacheClass::DefiniteMiss, None),
                 },
                 VirtualMemberFetchStrategy::Skip => (MemberCacheClass::DefiniteMiss, None),
@@ -1841,11 +1852,17 @@ where
             // Only reached for Remote members the strategy resolved as Proxy, so
             // a proxy service is guaranteed present.
             match proxy_service {
-                Some(proxy) => classify_stream_upstream(
-                    proxy.fetch_artifact_streaming(member, path).await,
-                    &member.key,
-                    path,
-                ),
+                Some(proxy) => {
+                    let mut outcome = classify_stream_upstream(
+                        proxy.fetch_artifact_streaming(member, path).await,
+                        &member.key,
+                        path,
+                    );
+                    if let MemberResolveOutcome::Hit(ref mut result) = outcome {
+                        result.member_id = Some(member.id);
+                    }
+                    outcome
+                }
                 None => MemberResolveOutcome::Miss,
             }
         },
@@ -2509,6 +2526,7 @@ async fn read_local_stream(
         body,
         content_type: Some(artifact.content_type.clone()),
         content_length: Some(artifact.size_bytes as u64),
+        member_id: None,
     })
 }
 
@@ -3988,6 +4006,8 @@ pub async fn serve_local_artifact(
     storage_key: &str,
     content_type: &str,
     content_disposition_filename: Option<&str>,
+    ip_address: Option<&str>,
+    user_agent: Option<&str>,
 ) -> Result<Response, Response> {
     let storage = state
         .storage_for_repo(&repo.storage_location())
@@ -4002,12 +4022,16 @@ pub async fn serve_local_artifact(
         .await
         .map_err(|e| internal_error("Storage", e))?;
 
-    let _ = sqlx::query(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-    )
-    .bind(artifact_id)
-    .execute(&state.db)
-    .await;
+    state
+        .download_tracker
+        .record_download(
+            crate::services::download_tracker::DownloadRecordBuilder::for_artifact(artifact_id)
+                .ip(ip_address.unwrap_or("0.0.0.0"))
+                .ua(user_agent)
+                .source(crate::services::download_tracker::DownloadSource::Proxy)
+                .build(),
+        )
+        .await;
 
     Ok(build_download_response(
         content,
@@ -4649,6 +4673,7 @@ mod tests {
             body: Box::pin(futures::stream::empty()),
             content_type: None,
             content_length: Some(0),
+            member_id: None,
         }
     }
 
@@ -7247,6 +7272,8 @@ mod tests {
             "cran/foo/1.0/foo.tar.gz",
             "application/gzip",
             Some("foo.tar.gz"),
+            None,
+            None,
         )
         .await
         .expect("serve");
@@ -7742,6 +7769,7 @@ mod tests {
             body: empty_body(),
             content_type: Some("application/java-archive".to_string()),
             content_length: None,
+            member_id: None,
         };
         let response = build_streaming_response(result, "application/octet-stream")
             .expect("response build must succeed");
@@ -7761,6 +7789,7 @@ mod tests {
             body: empty_body(),
             content_type: None,
             content_length: None,
+            member_id: None,
         };
         let response =
             build_streaming_response(result, "text/xml").expect("response build must succeed");
@@ -7782,6 +7811,7 @@ mod tests {
             body: empty_body(),
             content_type: Some("application/octet-stream".to_string()),
             content_length: Some(12345),
+            member_id: None,
         };
         let response = build_streaming_response(result, "application/octet-stream").unwrap();
         assert_eq!(
@@ -7804,6 +7834,7 @@ mod tests {
             body: empty_body(),
             content_type: Some("application/octet-stream".to_string()),
             content_length: None,
+            member_id: None,
         };
         let response = build_streaming_response(result, "application/octet-stream").unwrap();
         assert!(
@@ -7820,6 +7851,7 @@ mod tests {
             body: empty_body(),
             content_type: None,
             content_length: None,
+            member_id: None,
         };
         let response = build_streaming_response(result, "application/octet-stream").unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -7835,6 +7867,7 @@ mod tests {
             body: empty_body(),
             content_type: None,
             content_length: None,
+            member_id: None,
         };
         let response = build_streaming_response(result, weird).unwrap();
         assert_eq!(
@@ -7855,6 +7888,7 @@ mod tests {
             body: empty_body(),
             content_type: Some("application/zip".to_string()),
             content_length: Some(1234),
+            member_id: None,
         };
         let response = stream_fetch_result(result, "application/octet-stream", Some("pkg.whl"))
             .expect("stream_fetch_result must build a response");
@@ -7882,6 +7916,7 @@ mod tests {
             body: empty_body(),
             content_type: None,
             content_length: None,
+            member_id: None,
         };
         let response = stream_fetch_result(result, "application/octet-stream", None)
             .expect("stream_fetch_result must build a response");

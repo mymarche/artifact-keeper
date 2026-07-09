@@ -40,6 +40,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use artifact_keeper_backend::services::artifact_service::ArtifactService;
+use artifact_keeper_backend::services::download_tracker::DownloadTracker;
+use artifact_keeper_backend::services::event_bus::EventBus;
 use artifact_keeper_backend::storage::filesystem::FilesystemStorage;
 
 async fn connect_db() -> PgPool {
@@ -87,7 +89,14 @@ fn make_service(pool: PgPool) -> (ArtifactService, std::path::PathBuf) {
         std::env::temp_dir().join(format!("ak-checksum-test-{}", Uuid::new_v4().as_simple()));
     let storage: Arc<dyn artifact_keeper_backend::storage::StorageBackend> =
         Arc::new(FilesystemStorage::new(storage_root.clone()));
-    (ArtifactService::new(pool, storage), storage_root)
+    (
+        ArtifactService::new(
+            pool.clone(),
+            storage,
+            DownloadTracker::new(pool, Arc::new(EventBus::new(100))),
+        ),
+        storage_root,
+    )
 }
 
 /// Row fields read back when verifying the columns directly.

@@ -35,10 +35,12 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use tracing::info;
 
+use crate::api::extractors::{ClientIp, UserAgent};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
+use crate::services::download_tracker::{DownloadRecordBuilder, DownloadSource};
 
 // ---------------------------------------------------------------------------
 // Router
@@ -1254,6 +1256,8 @@ async fn upload(
 async fn download(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
+    client_ip: ClientIp,
+    user_agent: UserAgent,
     axum::Json(body): axum::Json<DownloadRequest>,
 ) -> Result<Response, Response> {
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
@@ -1429,14 +1433,18 @@ async fn download(
         let files = extract_files_from_bundle(&bundle_data)?;
         let commit = build_commit_info_from_row(&artifact_row);
 
-        // Record download
         let artifact_id: uuid::Uuid = artifact_row.get("id");
-        let _ = sqlx::query(
-            "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        )
-        .bind(artifact_id)
-        .execute(&state.db)
-        .await;
+        state
+            .download_tracker
+            .record_download(
+                DownloadRecordBuilder::for_artifact(artifact_id)
+                    .ip(client_ip.as_str())
+                    .ua(user_agent.as_str())
+                    .source(DownloadSource::Proxy)
+                    .repository_id(Some(repo.id))
+                    .build(),
+            )
+            .await;
 
         contents.push(DownloadContent { commit, files });
     }

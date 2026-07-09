@@ -24,10 +24,12 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
+use crate::api::extractors::{ClientIp, UserAgent};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
+use crate::services::download_tracker::{DownloadRecordBuilder, DownloadSource};
 
 // ---------------------------------------------------------------------------
 // Router
@@ -204,6 +206,8 @@ async fn resolve_go_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respon
 async fn handle_get(
     State(state): State<SharedState>,
     Path((repo_key, path)): Path<(String, String)>,
+    client_ip: ClientIp,
+    user_agent: UserAgent,
 ) -> Result<Response, Response> {
     let repo = resolve_go_repo(&state.db, &repo_key).await?;
     let request = parse_path(&path)?;
@@ -214,10 +218,26 @@ async fn handle_get(
             version_info(&state, &repo, &module, &version).await
         }
         GoProxyRequest::Mod { module, version } => {
-            get_mod_file(&state, &repo, &module, &version).await
+            get_mod_file(
+                &state,
+                &repo,
+                &module,
+                &version,
+                client_ip.as_str(),
+                user_agent.as_str(),
+            )
+            .await
         }
         GoProxyRequest::Zip { module, version } => {
-            download_zip(&state, &repo, &module, &version).await
+            download_zip(
+                &state,
+                &repo,
+                &module,
+                &version,
+                client_ip.as_str(),
+                user_agent.as_str(),
+            )
+            .await
         }
         GoProxyRequest::Latest { module } => latest_version(&state, &repo, &module).await,
         GoProxyRequest::SumDb { host, path } => proxy_sumdb(&host, &path).await,
@@ -620,6 +640,8 @@ async fn get_mod_file(
     repo: &RepoInfo,
     module: &str,
     version: &str,
+    client_ip: &str,
+    user_agent: Option<&str>,
 ) -> Result<Response, Response> {
     let artifact = sqlx::query!(
         r#"
@@ -733,13 +755,16 @@ async fn get_mod_file(
                 .into_response()
         })?;
 
-    // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    state
+        .download_tracker
+        .record_download(
+            DownloadRecordBuilder::for_artifact(artifact.id)
+                .ip(client_ip)
+                .ua(user_agent)
+                .source(DownloadSource::Proxy)
+                .build(),
+        )
+        .await;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -758,6 +783,8 @@ async fn download_zip(
     repo: &RepoInfo,
     module: &str,
     version: &str,
+    client_ip: &str,
+    user_agent: Option<&str>,
 ) -> Result<Response, Response> {
     let artifact = sqlx::query!(
         r#"
@@ -863,13 +890,16 @@ async fn download_zip(
                 .into_response()
         })?;
 
-    // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    state
+        .download_tracker
+        .record_download(
+            DownloadRecordBuilder::for_artifact(artifact.id)
+                .ip(client_ip)
+                .ua(user_agent)
+                .source(DownloadSource::Proxy)
+                .build(),
+        )
+        .await;
 
     Ok(Response::builder()
         .status(StatusCode::OK)

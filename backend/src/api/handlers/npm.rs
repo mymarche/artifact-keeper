@@ -30,7 +30,7 @@ use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Pr
 use tower_http::compression::CompressionLayer;
 use tracing::{debug, info};
 
-use crate::api::extractors::RequestBaseUrl;
+use crate::api::extractors::{ClientIp, RequestBaseUrl, UserAgent};
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
@@ -38,6 +38,7 @@ use crate::api::SharedState;
 use crate::error::AppError;
 use crate::models::repository::RepositoryType;
 use crate::services::age_gate_service::{AgeGateDecision, AgeGateService};
+use crate::services::download_tracker::{DownloadRecordBuilder, DownloadSource};
 use crate::services::npm_packument_cache::{
     self as packument_cache, CachedPackument, NpmPackumentCache,
 };
@@ -1822,21 +1823,41 @@ fn rewrite_and_respond_inner(
 async fn download_tarball(
     State(state): State<SharedState>,
     Path((repo_key, package, filename)): Path<(String, String, String)>,
+    client_ip: ClientIp,
+    user_agent: UserAgent,
 ) -> Result<Response, Response> {
     let package = normalize_package_name(&package);
     validate_package_name(&package)?;
-    serve_tarball(&state, &repo_key, &package, &filename).await
+    serve_tarball(
+        &state,
+        &repo_key,
+        &package,
+        &filename,
+        client_ip.as_str(),
+        user_agent.as_str(),
+    )
+    .await
 }
 
 async fn download_scoped_tarball(
     State(state): State<SharedState>,
     Path((repo_key, scope, package, filename)): Path<(String, String, String, String)>,
+    client_ip: ClientIp,
+    user_agent: UserAgent,
 ) -> Result<Response, Response> {
     let scope = normalize_package_name(&scope);
     let package = normalize_package_name(&package);
     let full_name = format!("@{}/{}", scope, package);
     validate_package_name(&full_name)?;
-    serve_tarball(&state, &repo_key, &full_name, &filename).await
+    serve_tarball(
+        &state,
+        &repo_key,
+        &full_name,
+        &filename,
+        client_ip.as_str(),
+        user_agent.as_str(),
+    )
+    .await
 }
 
 /// Fetch an npm tarball from a virtual member's local storage, matching
@@ -1926,6 +1947,7 @@ async fn npm_local_fetch(
         body,
         content_type: Some(artifact.content_type.clone()),
         content_length: Some(artifact.size_bytes as u64),
+        member_id: None,
     })
 }
 
@@ -1934,6 +1956,8 @@ async fn serve_tarball(
     repo_key: &str,
     package_name: &str,
     filename: &str,
+    client_ip: &str,
+    user_agent: Option<&str>,
 ) -> Result<Response, Response> {
     let repo = resolve_npm_repo(&state.db, repo_key).await?;
 
@@ -2159,13 +2183,16 @@ async fn serve_tarball(
         .await
         .map_err(map_storage_err)?;
 
-    // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    state
+        .download_tracker
+        .record_download(
+            DownloadRecordBuilder::for_artifact(artifact.id)
+                .ip(client_ip)
+                .ua(user_agent)
+                .source(DownloadSource::Proxy)
+                .build(),
+        )
+        .await;
 
     Ok(build_tarball_response_stream(
         stream,
@@ -4762,6 +4789,8 @@ mod tests {
                 "testpkg".to_string(),
                 "testpkg-1.0.0.tgz".to_string(),
             )),
+            ClientIp("127.0.0.1".parse().unwrap()),
+            UserAgent(None),
         )
         .await;
 
@@ -4863,6 +4892,8 @@ mod tests {
                     "bigpkg".to_string(),
                     "bigpkg-1.0.0.tgz".to_string(),
                 )),
+                ClientIp("127.0.0.1".parse().unwrap()),
+                UserAgent(None),
             )
             .await;
 
@@ -6189,6 +6220,8 @@ mod db_cov_tests {
             &fx.repo_key,
             package,
             &format!("{package}-9.9.9.tgz"),
+            "127.0.0.1",
+            None,
         )
         .await;
         let aged = super::serve_tarball(
@@ -6196,6 +6229,8 @@ mod db_cov_tests {
             &fx.repo_key,
             package,
             &format!("{package}-1.0.0.tgz"),
+            "127.0.0.1",
+            None,
         )
         .await;
 

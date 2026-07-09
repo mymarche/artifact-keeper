@@ -26,11 +26,12 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
-use crate::api::extractors::RequestBaseUrl;
+use crate::api::extractors::{ClientIp, RequestBaseUrl, UserAgent};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
+use crate::services::download_tracker::{DownloadRecordBuilder, DownloadSource};
 
 const LFS_CONTENT_TYPE: &str = "application/vnd.git-lfs+json";
 
@@ -568,6 +569,8 @@ async fn upload_object(
 async fn download_object(
     State(state): State<SharedState>,
     Path((repo_key, oid)): Path<(String, String)>,
+    client_ip: ClientIp,
+    user_agent: UserAgent,
 ) -> Result<Response, Response> {
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
     validate_oid(&oid)?;
@@ -673,13 +676,17 @@ async fn download_object(
             )
         })?;
 
-    // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    state
+        .download_tracker
+        .record_download(
+            DownloadRecordBuilder::for_artifact(artifact.id)
+                .ip(client_ip.as_str())
+                .ua(user_agent.as_str())
+                .source(DownloadSource::Proxy)
+                .repository_id(Some(repo.id))
+                .build(),
+        )
+        .await;
 
     Ok(Response::builder()
         .status(StatusCode::OK)

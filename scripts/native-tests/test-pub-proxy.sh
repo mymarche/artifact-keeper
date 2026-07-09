@@ -158,6 +158,37 @@ DART_EXIT=$?
 docker stop "$NGINX_CID" >/dev/null 2>&1 || true
 
 # ---- Step 4: Summary ----
+# ---- Verify download statistics ----
+echo ""
+echo "==> Verifying download statistics..."
+DOWNLOAD_STATS=$(curl -s -u "$ADMIN_USER:$ADMIN_PASS" \
+  "$REGISTRY_URL/api/v1/admin/downloads?per_page=5")
+DOWNLOAD_COUNT=$(echo "$DOWNLOAD_STATS" | python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)
+    print(len(d.get('items',[])))
+except: print('0')
+" 2>/dev/null || echo "0")
+if [ "$DOWNLOAD_COUNT" -gt 0 ] 2>/dev/null; then
+  echo "  ✅ Download statistics recorded ($DOWNLOAD_COUNT items)"
+  FIRST_SOURCE=$(echo "$DOWNLOAD_STATS" | python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)
+    items=d.get('items',[])
+    print(items[0].get('source','empty') if items else 'empty')
+except: print('error')
+" 2>/dev/null || echo "empty")
+  if [ "$FIRST_SOURCE" != "empty" ] && [ "$FIRST_SOURCE" != "error" ]; then
+    echo "  ✅ Download source populated: $FIRST_SOURCE"
+  else
+    echo "  ⚠️  Download source missing in statistics"
+  fi
+else
+  echo "  ⚠️  No download statistics recorded"
+fi
+
 echo ""
 echo "=============================================="
 echo "PROXY TEST SUMMARY"

@@ -30,10 +30,12 @@ use sha2::{Digest, Sha256};
 use std::io::Write;
 use tracing::info;
 
+use crate::api::extractors::{ClientIp, UserAgent};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
+use crate::services::download_tracker::{DownloadRecordBuilder, DownloadSource};
 use crate::services::signing_service::SigningService;
 
 // ---------------------------------------------------------------------------
@@ -747,6 +749,8 @@ async fn upstream_proxy(
 async fn download_package(
     State(state): State<SharedState>,
     Path((repo_key, pkg_path)): Path<(String, String)>,
+    client_ip: ClientIp,
+    user_agent: UserAgent,
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
@@ -810,13 +814,17 @@ async fn download_package(
                 .into_response()
         })?;
 
-    // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    state
+        .download_tracker
+        .record_download(
+            DownloadRecordBuilder::for_artifact(artifact.id)
+                .ip(client_ip.as_str())
+                .ua(user_agent.as_str())
+                .source(DownloadSource::Proxy)
+                .repository_id(Some(repo.id))
+                .build(),
+        )
+        .await;
 
     Ok(build_rpm_package_response(
         Body::from_stream(stream),

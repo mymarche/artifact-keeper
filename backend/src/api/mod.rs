@@ -12,6 +12,7 @@ pub mod validation;
 use crate::config::Config;
 use crate::services::artifact_service::ArtifactService;
 use crate::services::dependency_track_service::DependencyTrackService;
+use crate::services::download_tracker::DownloadTracker;
 use crate::services::event_bus::EventBus;
 use crate::services::npm_packument_cache::NpmPackumentCache;
 use crate::services::opensearch_service::OpenSearchService;
@@ -112,6 +113,7 @@ pub struct AppState {
     pub quality_check_service: Option<Arc<QualityCheckService>>,
     pub permission_service: Arc<PermissionService>,
     pub proxy_service: Option<Arc<ProxyService>>,
+    pub download_tracker: DownloadTracker,
     pub smtp_service: Option<Arc<SmtpService>>,
     pub metrics_handle: Option<Arc<PrometheusHandle>>,
     pub age_gate_service: Option<Arc<crate::services::age_gate_service::AgeGateService>>,
@@ -182,6 +184,8 @@ impl AppState {
             );
         }
         let npm_packument_cache = NpmPackumentCache::from_config(&config);
+        let event_bus = Arc::new(EventBus::new(1024));
+        let download_tracker = DownloadTracker::new(db.clone(), event_bus.clone());
         Self {
             config,
             db,
@@ -196,10 +200,11 @@ impl AppState {
             permission_service,
             proxy_service: None,
             age_gate_service: None,
+            download_tracker,
             smtp_service: None,
             metrics_handle: None,
             setup_required: Arc::new(AtomicBool::new(false)),
-            event_bus: Arc::new(EventBus::new(1024)),
+            event_bus,
             repo_cache: Arc::new(RwLock::new(HashMap::new())),
             index_cache: Arc::new(RwLock::new(HashMap::new())),
             npm_packument_cache,
@@ -227,6 +232,8 @@ impl AppState {
             );
         }
         let npm_packument_cache = NpmPackumentCache::from_config(&config);
+        let event_bus = Arc::new(EventBus::new(1024));
+        let download_tracker = DownloadTracker::new(db.clone(), event_bus.clone());
         Self {
             config,
             db,
@@ -241,10 +248,11 @@ impl AppState {
             permission_service,
             proxy_service: None,
             age_gate_service: None,
+            download_tracker,
             smtp_service: None,
             metrics_handle: None,
             setup_required: Arc::new(AtomicBool::new(false)),
-            event_bus: Arc::new(EventBus::new(1024)),
+            event_bus,
             repo_cache: Arc::new(RwLock::new(HashMap::new())),
             index_cache: Arc::new(RwLock::new(HashMap::new())),
             npm_packument_cache,
@@ -328,8 +336,12 @@ impl AppState {
 
     /// Create an ArtifactService with the shared search and scanner services.
     pub fn create_artifact_service(&self, storage: Arc<dyn StorageBackend>) -> ArtifactService {
-        let mut svc =
-            ArtifactService::new_with_search(self.db.clone(), storage, self.search_service.clone());
+        let mut svc = ArtifactService::new_with_search(
+            self.db.clone(),
+            storage,
+            self.download_tracker.clone(),
+            self.search_service.clone(),
+        );
         if let Some(ref scanner) = self.scanner_service {
             svc.set_scanner_service(scanner.clone());
         }

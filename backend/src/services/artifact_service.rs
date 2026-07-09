@@ -13,6 +13,8 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
+use crate::services::download_tracker::{DownloadRecordBuilder, DownloadSource, DownloadTracker};
+use crate::services::event_bus::EventBus;
 use crate::services::opensearch_service::{ArtifactDocument, OpenSearchService};
 use crate::services::plugin_service::{ArtifactInfo, PluginEventType, PluginService};
 use crate::services::quality_check_service::QualityCheckService;
@@ -117,6 +119,7 @@ pub struct ArtifactService {
     db: PgPool,
     storage: Arc<dyn StorageBackend>,
     repo_service: RepositoryService,
+    download_tracker: DownloadTracker,
     plugin_service: Option<Arc<PluginService>>,
     scanner_service: Option<Arc<ScannerService>>,
     quality_check_service: Option<Arc<QualityCheckService>>,
@@ -125,12 +128,17 @@ pub struct ArtifactService {
 
 impl ArtifactService {
     /// Create a new artifact service
-    pub fn new(db: PgPool, storage: Arc<dyn StorageBackend>) -> Self {
+    pub fn new(
+        db: PgPool,
+        storage: Arc<dyn StorageBackend>,
+        download_tracker: DownloadTracker,
+    ) -> Self {
         let repo_service = RepositoryService::new(db.clone());
         Self {
             db,
             storage,
             repo_service,
+            download_tracker,
             plugin_service: None,
             scanner_service: None,
             quality_check_service: None,
@@ -142,6 +150,7 @@ impl ArtifactService {
     pub fn new_with_search(
         db: PgPool,
         storage: Arc<dyn StorageBackend>,
+        download_tracker: DownloadTracker,
         search_service: Option<Arc<OpenSearchService>>,
     ) -> Self {
         let repo_service = RepositoryService::new(db.clone());
@@ -149,6 +158,7 @@ impl ArtifactService {
             db,
             storage,
             repo_service,
+            download_tracker,
             plugin_service: None,
             scanner_service: None,
             quality_check_service: None,
@@ -160,6 +170,7 @@ impl ArtifactService {
     pub fn with_plugins(
         db: PgPool,
         storage: Arc<dyn StorageBackend>,
+        download_tracker: DownloadTracker,
         plugin_service: Arc<PluginService>,
     ) -> Self {
         let repo_service = RepositoryService::new(db.clone());
@@ -167,6 +178,7 @@ impl ArtifactService {
             db,
             storage,
             repo_service,
+            download_tracker,
             plugin_service: Some(plugin_service),
             scanner_service: None,
             quality_check_service: None,
@@ -944,20 +956,16 @@ impl ArtifactService {
         ip_address: Option<&str>,
         user_agent: Option<&str>,
     ) {
-        // Record download statistics
-        sqlx::query!(
-            r#"
-            INSERT INTO download_statistics (artifact_id, user_id, ip_address, user_agent)
-            VALUES ($1, $2, $3, $4)
-            "#,
-            artifact_id,
-            user_id,
-            ip_address,
-            user_agent
-        )
-        .execute(&self.db)
-        .await
-        .ok(); // Ignore stats errors
+        self.download_tracker
+            .record_download(
+                DownloadRecordBuilder::for_artifact(artifact_id)
+                    .user_id(user_id)
+                    .ip(ip_address.unwrap_or("0.0.0.0"))
+                    .ua(user_agent)
+                    .source(DownloadSource::Proxy)
+                    .build(),
+            )
+            .await;
 
         // Trigger AfterDownload hooks (non-blocking)
         self.trigger_hook_non_blocking(PluginEventType::AfterDownload, artifact_info)
@@ -2228,7 +2236,11 @@ mod tests {
         let storage: Arc<dyn StorageBackend> = Arc::new(
             crate::storage::filesystem::FilesystemStorage::new(storage_dir.clone()),
         );
-        let svc = ArtifactService::new(pool.clone(), storage);
+        let svc = ArtifactService::new(
+            pool.clone(),
+            storage,
+            Arc::new(DownloadTracker::new(pool.clone(), EventBus::new(100))),
+        );
 
         // -- (a) dists/… index coordinate: overwrite after tombstone ALLOWED --
         let dists_path = "dists/bookworm/main/binary-amd64/Packages";

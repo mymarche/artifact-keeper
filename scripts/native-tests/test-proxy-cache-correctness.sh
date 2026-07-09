@@ -251,6 +251,26 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------------
+# Verify download statistics
+# ---------------------------------------------------------------------------
+echo "==> Verifying download statistics..."
+DOWNLOAD_RESP=$(curl -s -H "$AUTH" "$API_URL/admin/downloads?per_page=5")
+DOWNLOAD_COUNT=$(echo "$DOWNLOAD_RESP" | jq -r '.items | length' 2>/dev/null || echo "0")
+if [ "$DOWNLOAD_COUNT" -gt 0 ] 2>/dev/null; then
+    pass "Download statistics recorded ($DOWNLOAD_COUNT items)"
+    # Verify first item has required fields
+    FIRST_SOURCE=$(echo "$DOWNLOAD_RESP" | jq -r '.items[0].source // "empty"')
+    if [ "$FIRST_SOURCE" != "empty" ] && [ "$FIRST_SOURCE" != "null" ]; then
+        pass "Download source is populated: $FIRST_SOURCE"
+    else
+        fail "Download source is missing in statistics"
+    fi
+else
+    fail "No download statistics recorded (expected > 0 items after proxy fetches)"
+fi
+echo ""
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 TOTAL=$((PASSED + FAILED + SKIPPED))
