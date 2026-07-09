@@ -25,7 +25,7 @@ use axum::Router;
 use sqlx::PgPool;
 use tracing::info;
 
-use crate::api::extractors::RequestBaseUrl;
+use crate::api::extractors::{ClientIp, RequestBaseUrl, UserAgent};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
@@ -33,6 +33,7 @@ use crate::models::repository::RepositoryType;
 use crate::models::user::User;
 use crate::services::auth_service::AuthService;
 use crate::services::curation_service::version_compare;
+use crate::services::download_tracker::{DownloadRecordBuilder, DownloadSource};
 
 // ---------------------------------------------------------------------------
 // Router
@@ -646,6 +647,8 @@ async fn flatcontainer_versions(
 async fn flatcontainer_download(
     State(state): State<SharedState>,
     Path((repo_key, package_id, version, filename)): Path<(String, String, String, String)>,
+    client_ip: ClientIp,
+    user_agent: UserAgent,
 ) -> Result<Response, Response> {
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
     let package_id_lower = package_id.to_lowercase();
@@ -817,13 +820,17 @@ async fn flatcontainer_download(
                 })?
         };
 
-    // Record download.
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    state
+        .download_tracker
+        .record_download(
+            DownloadRecordBuilder::for_artifact(artifact.id)
+                .ip(client_ip.as_str())
+                .ua(user_agent.as_str())
+                .source(DownloadSource::Proxy)
+                .repository_id(Some(repo.id))
+                .build(),
+        )
+        .await;
 
     use futures::StreamExt as _;
     Ok(Response::builder()
@@ -2019,6 +2026,8 @@ mod tests {
                 version.to_string(),
                 filename.clone(),
             )),
+            ClientIp("127.0.0.1".parse().unwrap()),
+            UserAgent(None),
         )
         .await;
 

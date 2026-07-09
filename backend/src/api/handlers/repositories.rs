@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::api::download_response::{DownloadResponse, X_ARTIFACT_STORAGE};
 use crate::api::dto::Pagination;
+use crate::services::download_tracker::{DownloadRecordBuilder, DownloadSource};
 // Use the crate-local `Json` extractor so any deserialization failure on a
 // request body surfaces as HTTP 400 + `{code: "VALIDATION_ERROR"}` instead of
 // Axum's default 422 + plain-text body. See #1368 and the module docs in
@@ -2216,7 +2217,8 @@ pub async fn list_artifacts(
     require_visible(&repo, &auth, &repo_service).await?;
 
     let storage = state.storage_for_repo(&repo.storage_location())?;
-    let artifact_service = ArtifactService::new(state.db.clone(), storage);
+    let artifact_service =
+        ArtifactService::new(state.db.clone(), storage, state.download_tracker.clone());
 
     let is_maven_format = matches!(
         repo.format,
@@ -3553,7 +3555,8 @@ pub async fn get_artifact_metadata(
     require_visible(&repo, &auth, &repo_service).await?;
 
     let storage = state.storage_for_repo(&repo.storage_location())?;
-    let artifact_service = ArtifactService::new(state.db.clone(), storage);
+    let artifact_service =
+        ArtifactService::new(state.db.clone(), storage, state.download_tracker.clone());
 
     // #1443: npm publish stores tarballs under
     // `<name>/<version>/<name>-<version>.tgz` (see
@@ -4418,19 +4421,19 @@ pub async fn download_artifact(
                 .get_presigned_url(&artifact.storage_key, expiry)
                 .await?
             {
-                // Record download analytics (best-effort; must not block the
-                // redirect). This previously inserted into an events table
-                // that does not exist in the schema — and discarded the
-                // error — so every presigned/redirect download was silently
-                // missing from download statistics (#2260, bug 1).
-                record_redirect_download(
-                    &state.db,
-                    artifact.id,
-                    auth.as_ref().map(|a| a.user_id),
-                    &ip_addr.to_string(),
-                    user_agent.as_deref(),
-                )
-                .await;
+                state
+                    .download_tracker
+                    .record_download(
+                        DownloadRecordBuilder::for_artifact(artifact.id)
+                            .user_id(auth.as_ref().map(|a| a.user_id))
+                            .ip(ip_addr.to_string())
+                            .ua(user_agent.as_deref())
+                            .source(DownloadSource::Redirect(presigned.source))
+                            .repository_id(Some(repo.id))
+                            .actor(auth.as_ref().map(|a| a.username.clone()))
+                            .build(),
+                    )
+                    .await;
 
                 tracing::info!(
                     repo = %key,
@@ -4444,7 +4447,8 @@ pub async fn download_artifact(
     }
 
     // Fall back to proxied download (filesystem or S3 without redirect)
-    let artifact_service = ArtifactService::new(state.db.clone(), storage);
+    let artifact_service =
+        ArtifactService::new(state.db.clone(), storage, state.download_tracker.clone());
 
     let download_result = artifact_service
         .download_stream(

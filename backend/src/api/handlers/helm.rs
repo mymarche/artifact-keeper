@@ -20,6 +20,7 @@ use axum::Router;
 use sqlx::{PgPool, Row};
 use tracing::info;
 
+use crate::api::extractors::{ClientIp, UserAgent};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
@@ -393,6 +394,8 @@ async fn download_chart_via_index(
 async fn download_chart(
     State(state): State<SharedState>,
     Path((repo_key, filename)): Path<(String, String)>,
+    client_ip: ClientIp,
+    user_agent: UserAgent,
 ) -> Result<Response, Response> {
     let repo = resolve_helm_repo(&state.db, &repo_key).await?;
 
@@ -429,6 +432,8 @@ async fn download_chart(
         &artifact.storage_key,
         "application/gzip",
         Some(&filename),
+        Some(client_ip.as_str()),
+        user_agent.as_str(),
     )
     .await
 }

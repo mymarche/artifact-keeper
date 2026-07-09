@@ -282,6 +282,7 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
         body: stream,
         content_type: None,
         content_length: None,
+        member_id: None,
     })
 }
 

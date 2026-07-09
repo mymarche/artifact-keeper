@@ -27,6 +27,7 @@ use sqlx::PgPool;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::api::extractors::{ClientIp, UserAgent};
 use crate::api::handlers::cache_headers;
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
@@ -35,6 +36,7 @@ use crate::api::SharedState;
 use crate::error::AppError;
 use crate::formats::maven::{generate_metadata_xml, MavenCoordinates, MavenHandler};
 use crate::models::repository::RepositoryType;
+use crate::services::download_tracker::{DownloadRecordBuilder, DownloadSource};
 
 // TODO: Remaining format handlers (beyond maven, npm, pypi, cargo) still use
 // plain-text error responses and should be migrated to AppError (#553).
@@ -355,6 +357,7 @@ async fn maven_local_fetch_snapshot(
         body: stream,
         content_type: Some(ct),
         content_length: None,
+        member_id: None,
     })
 }
 
@@ -823,6 +826,8 @@ async fn download(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, path)): Path<(String, String)>,
     headers: HeaderMap,
+    client_ip: ClientIp,
+    user_agent: UserAgent,
 ) -> Result<Response, Response> {
     let repo = resolve_maven_repo(&state.db, &repo_key).await?;
     let storage = state
@@ -997,7 +1002,16 @@ async fn download(
     }
 
     // 4. Serve the artifact file
-    serve_artifact(&state, &repo, &repo_key, &path, auth.as_ref()).await
+    serve_artifact(
+        &state,
+        &repo,
+        &repo_key,
+        &path,
+        auth.as_ref(),
+        client_ip.as_str(),
+        user_agent.as_str(),
+    )
+    .await
 }
 
 /// Fetch a single Remote virtual member's Maven metadata document at `path`
@@ -1380,6 +1394,8 @@ async fn serve_artifact(
     repo_key: &str,
     path: &str,
     auth: Option<&AuthExtension>,
+    client_ip: &str,
+    user_agent: Option<&str>,
 ) -> Result<Response, Response> {
     // Remote (proxy) repos never persist rows in the `artifacts` table: the
     // proxy cache writes to the package catalog + filesystem only (guarded by
@@ -1647,13 +1663,17 @@ async fn serve_artifact(
         .await
         .map_err(map_storage_err)?;
 
-    // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    state
+        .download_tracker
+        .record_download(
+            DownloadRecordBuilder::for_proxy_cache(repo.id, path, &state.db)
+                .await
+                .ip(client_ip)
+                .ua(user_agent)
+                .source(DownloadSource::Proxy)
+                .build(),
+        )
+        .await;
 
     let ct = content_type_for_path(path);
     let mut builder = Response::builder()
@@ -4019,6 +4039,8 @@ mod tests {
             Extension(Some(auth.clone())),
             Path((repo_key.to_string(), meta_path.to_string())),
             axum::http::HeaderMap::new(),
+            ClientIp("127.0.0.1".parse().unwrap()),
+            UserAgent(None),
         )
         .await
         .expect("metadata download must succeed");
@@ -4036,6 +4058,8 @@ mod tests {
             Extension(Some(auth.clone())),
             Path((repo_key.to_string(), format!("{}.{}", meta_path, ext))),
             axum::http::HeaderMap::new(),
+            ClientIp("127.0.0.1".parse().unwrap()),
+            UserAgent(None),
         )
         .await
         .expect("checksum download must succeed");
@@ -4580,6 +4604,8 @@ mod tests {
             Extension(Some(auth.clone())),
             Path((virtual_key.clone(), meta_path.clone())),
             HeaderMap::new(),
+            ClientIp("127.0.0.1".parse().unwrap()),
+            UserAgent(None),
         )
         .await
         .expect("virtual metadata download must succeed");
@@ -4690,6 +4716,8 @@ mod tests {
             Extension(Some(auth)),
             Path((virtual_key.clone(), pom_path.to_string())),
             HeaderMap::new(),
+            ClientIp("127.0.0.1".parse().unwrap()),
+            UserAgent(None),
         )
         .await;
 

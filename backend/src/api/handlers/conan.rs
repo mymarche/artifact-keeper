@@ -31,12 +31,14 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
+use crate::api::extractors::{ClientIp, UserAgent};
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
 use crate::services::auth_service::AuthService;
+use crate::services::download_tracker::{DownloadRecordBuilder, DownloadSource};
 
 // ---------------------------------------------------------------------------
 // Router
@@ -1553,6 +1555,8 @@ async fn recipe_file_download(
         String,
         String,
     )>,
+    client_ip: ClientIp,
+    user_agent: UserAgent,
 ) -> Result<Response, Response> {
     let repo = resolve_conan_repo(&state.db, &repo_key).await?;
 
@@ -1668,13 +1672,17 @@ async fn recipe_file_download(
         .await
         .map_err(map_storage_err)?;
 
-    // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    state
+        .download_tracker
+        .record_download(
+            DownloadRecordBuilder::for_artifact(artifact.id)
+                .ip(client_ip.as_str())
+                .ua(user_agent.as_str())
+                .source(DownloadSource::Proxy)
+                .repository_id(Some(repo.id))
+                .build(),
+        )
+        .await;
 
     let ct = content_type_for_conan_file(&file_path);
 
@@ -2356,6 +2364,8 @@ async fn package_file_download(
         String,
         String,
     )>,
+    client_ip: ClientIp,
+    user_agent: UserAgent,
 ) -> Result<Response, Response> {
     let repo = resolve_conan_repo(&state.db, &repo_key).await?;
 
@@ -2477,13 +2487,17 @@ async fn package_file_download(
         .await
         .map_err(map_storage_err)?;
 
-    // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    state
+        .download_tracker
+        .record_download(
+            DownloadRecordBuilder::for_artifact(artifact.id)
+                .ip(client_ip.as_str())
+                .ua(user_agent.as_str())
+                .source(DownloadSource::Proxy)
+                .repository_id(Some(repo.id))
+                .build(),
+        )
+        .await;
 
     let ct = content_type_for_conan_file(&file_path);
 

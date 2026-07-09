@@ -90,6 +90,9 @@ pub struct StreamingFetchResult {
     /// without a length advertised, in which case the outbound response
     /// uses chunked transfer encoding.
     pub content_length: Option<u64>,
+    /// When this result was resolved through a virtual repository,
+    /// the `id` of the member repository that served the artifact.
+    pub member_id: Option<Uuid>,
 }
 
 impl From<StreamHandle> for StreamingFetchResult {
@@ -101,6 +104,7 @@ impl From<StreamHandle> for StreamingFetchResult {
             body: handle.body,
             content_type: handle.headers.content_type,
             content_length: handle.headers.content_length,
+            member_id: None,
         }
     }
 }
@@ -2818,6 +2822,7 @@ impl ProxyService {
                 body,
                 content_type: metadata.content_type.clone(),
                 content_length: Some(metadata.size_bytes as u64),
+                member_id: None,
             })),
             Err(AppError::NotFound(_)) => {
                 tracing::debug!(
@@ -9167,6 +9172,7 @@ mod tests {
             body: dummy,
             content_type: Some("application/octet-stream".to_string()),
             content_length: Some(12345),
+            member_id: None,
         };
         assert_eq!(r.content_length, Some(12345));
         assert_eq!(r.content_type.as_deref(), Some("application/octet-stream"));

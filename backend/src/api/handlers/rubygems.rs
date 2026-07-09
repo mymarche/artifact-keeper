@@ -29,6 +29,7 @@ use std::io::Read as IoRead;
 use std::io::Write as IoWrite;
 use tracing::info;
 
+use crate::api::extractors::{ClientIp, UserAgent};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
@@ -197,6 +198,8 @@ async fn gem_versions(
 async fn download_gem(
     State(state): State<SharedState>,
     Path((repo_key, gem_file)): Path<(String, String)>,
+    client_ip: ClientIp,
+    user_agent: UserAgent,
 ) -> Result<Response, Response> {
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
 
@@ -262,6 +265,8 @@ async fn download_gem(
         &artifact.storage_key,
         "application/octet-stream",
         Some(filename),
+        Some(client_ip.as_str()),
+        user_agent.as_str(),
     )
     .await
 }

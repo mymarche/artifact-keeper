@@ -17,6 +17,7 @@ pub mod cluster_lock;
 pub mod cluster_work;
 pub mod declared_dependencies;
 pub mod dependency_track_service;
+pub mod download_tracker;
 pub mod email_dispatcher;
 pub mod email_rate_limiter;
 pub mod encryption;

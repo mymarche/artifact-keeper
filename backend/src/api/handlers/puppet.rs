@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
+use crate::api::extractors::{ClientIp, UserAgent};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
@@ -268,6 +269,8 @@ async fn release_info(
 async fn download_module(
     State(state): State<SharedState>,
     Path((repo_key, file_path)): Path<(String, String)>,
+    client_ip: ClientIp,
+    user_agent: UserAgent,
 ) -> Result<Response, Response> {
     let repo = resolve_puppet_repo(&state.db, &repo_key).await?;
 
@@ -310,6 +313,8 @@ async fn download_module(
         &artifact.storage_key,
         "application/gzip",
         Some(filename),
+        Some(client_ip.as_str()),
+        user_agent.as_str(),
     )
     .await
 }

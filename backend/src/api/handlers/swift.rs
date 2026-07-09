@@ -23,11 +23,13 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
+use crate::api::extractors::{ClientIp, UserAgent};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::swift::SwiftHandler;
 use crate::models::repository::RepositoryType;
+use crate::services::download_tracker::{DownloadRecordBuilder, DownloadSource};
 
 // ---------------------------------------------------------------------------
 // Router
@@ -311,13 +313,24 @@ pub async fn query_release_versions_virtual(
 async fn version_path_handler(
     State(state): State<SharedState>,
     Path((repo_key, scope, name, version_path)): Path<(String, String, String, String)>,
+    client_ip: ClientIp,
+    user_agent: UserAgent,
 ) -> Result<Response, Response> {
     let version_path = version_path.trim_start_matches('/');
 
     if version_path.ends_with(".zip") {
         // Download source archive: /:scope/:name/:version.zip
         let version = version_path.trim_end_matches(".zip");
-        return download_archive(state, &repo_key, &scope, &name, version).await;
+        return download_archive(
+            state,
+            &repo_key,
+            &scope,
+            &name,
+            version,
+            client_ip.as_str(),
+            user_agent.as_str(),
+        )
+        .await;
     }
 
     if version_path.ends_with("/Package.swift") || version_path.contains("/Package.swift") {
@@ -483,6 +496,8 @@ async fn download_archive(
     scope: &str,
     name: &str,
     version: &str,
+    client_ip: &str,
+    user_agent: Option<&str>,
 ) -> Result<Response, Response> {
     let repo = resolve_swift_repo(&state.db, repo_key).await?;
     let package_id = format!("{}.{}", scope, name);
@@ -590,13 +605,16 @@ async fn download_archive(
             )
         })?;
 
-    // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    state
+        .download_tracker
+        .record_download(
+            DownloadRecordBuilder::for_artifact(artifact.id)
+                .ip(client_ip)
+                .ua(user_agent)
+                .source(DownloadSource::Proxy)
+                .build(),
+        )
+        .await;
 
     let checksum = artifact.checksum_sha256.clone();
     let filename = format!("{}-{}-{}.zip", scope, name, version);
@@ -1545,6 +1563,8 @@ mod db_cov_tests {
                 "apple",
                 "swift-nio",
                 "2.40.0",
+                "127.0.0.1",
+                None,
             )
             .await;
             let response = match result {
