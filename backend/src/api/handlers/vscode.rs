@@ -34,7 +34,7 @@ use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
 use crate::formats::vscode_extensions::{self, VsixMetadata};
-use crate::models::repository::{RepositoryFormat, RepositoryType};
+use crate::models::repository::{RepositoryFormat, RepositoryType, RepositoryVisibility};
 use crate::util::bounded_archive;
 
 // ---------------------------------------------------------------------------
@@ -349,15 +349,28 @@ fn unsupported_gallery_repo_type(repo: &RepoInfo) -> Response {
         .into_response()
 }
 
-fn private_gallery_forbidden(repo: &RepoInfo) -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        format!(
+/// The gallery routes are anonymous-only, so any repository that is not
+/// `public` is refused here. The message names the repository's ACTUAL
+/// visibility rather than calling everything "private": an `internal`
+/// repository told it is private sends the operator looking for a grant to
+/// add, when the real reason is that a gallery client cannot present a
+/// credential at all and no grant would help.
+fn non_public_gallery_forbidden(repo: &RepoInfo, visibility: RepositoryVisibility) -> Response {
+    let message = match visibility {
+        // Byte-for-byte the long-standing private refusal: only `internal`
+        // gets the new wording.
+        RepositoryVisibility::Private => format!(
             "VS Code gallery routes are public-only: repository {} is private. Gallery clients cannot present a credential, so private galleries are not supported. Make the repository public or use the /vscode/{}/extensions/... routes.",
             repo.key, repo.key
         ),
-    )
-        .into_response()
+        _ => format!(
+            "VS Code gallery routes are public-only: repository {} is {}. Gallery clients cannot present a credential, so only an anonymously readable repository can serve them — `internal` is not enough, because there is no principal to resolve. Make the repository public or use the /vscode/{}/extensions/... routes.",
+            repo.key,
+            visibility.as_str(),
+            repo.key
+        ),
+    };
+    (StatusCode::FORBIDDEN, message).into_response()
 }
 
 /// The gate every gallery route shares: a servable repository type, and public.
@@ -375,15 +388,20 @@ async fn gallery_gate(db: &PgPool, repo: &RepoInfo) -> Result<(), Response> {
     {
         return Err(unsupported_gallery_repo_type(repo));
     }
-    let is_public =
-        sqlx::query_scalar::<_, bool>("SELECT is_public FROM repositories WHERE id = $1")
-            .bind(repo.id)
-            .fetch_optional(db)
-            .await
-            .map_err(crate::api::handlers::db_err)?
-            .ok_or_else(|| (StatusCode::NOT_FOUND, "Repository not found").into_response())?;
-    if !is_public {
-        return Err(private_gallery_forbidden(repo));
+    // The predicate is `allows_anonymous_read`, which is the same decision the
+    // `is_public` mirror produced — `internal` is refused here exactly as
+    // `private` is. Reading `visibility` rather than the boolean is what lets
+    // the refusal say which state the repository is actually in.
+    let visibility = sqlx::query_scalar::<_, RepositoryVisibility>(
+        "SELECT visibility FROM repositories WHERE id = $1",
+    )
+    .bind(repo.id)
+    .fetch_optional(db)
+    .await
+    .map_err(crate::api::handlers::db_err)?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, "Repository not found").into_response())?;
+    if !visibility.allows_anonymous_read() {
+        return Err(non_public_gallery_forbidden(repo, visibility));
     }
     Ok(())
 }
@@ -6063,6 +6081,59 @@ mod tests {
         fx.teardown().await;
     }
 
+    /// #3813: an `internal` repository is still refused, and the refusal says
+    /// `internal`.
+    ///
+    /// The gate read the deprecated `is_public` mirror, so every non-public
+    /// state was reported as "private". For an internal repository that is
+    /// doubly wrong: it names a state the repository is not in, and it points
+    /// the operator at a remedy that cannot work, since a gallery client
+    /// presents no credential and no grant would help. The decision itself is
+    /// unchanged — `allows_anonymous_read()` refuses `internal` exactly as
+    /// `is_public = false` did — which is why the status assertion below is the
+    /// same one the private test makes.
+    #[tokio::test]
+    async fn gallery_routes_reject_internal_remote_and_name_the_state() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "vscode").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make Remote gallery repository internal");
+
+        let bearer = tdh::bearer_for(&fx.state, fx.user_id).await;
+        let app = crate::api::routes::create_router(fx.state.clone());
+        let mut request = tdh::get(format!("/vscode/{}/gallery/manifest", fx.repo_key));
+        request.headers_mut().insert(
+            "authorization",
+            bearer
+                .parse::<axum::http::HeaderValue>()
+                .expect("valid bearer header"),
+        );
+        let (status, body) = tdh::send(app, request).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "internal must be refused by the public-only gallery contract, \
+             exactly as private is"
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("is internal"),
+            "the refusal must name the repository's actual visibility, got: {text}"
+        );
+        assert!(
+            !text.contains("is private"),
+            "an internal repository must not be described as private: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn gallery_routes_reject_percent_decoded_unsafe_coordinates_before_proxying() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -7947,6 +8018,61 @@ mod tests {
         hasher2.update(data);
         let hash2 = format!("{:x}", hasher2.finalize());
         assert_eq!(hash, hash2);
+    }
+
+    /// #3813: the private refusal body is unchanged from before the
+    /// visibility axis existed; only `internal` gets the new wording.
+    #[tokio::test]
+    async fn non_public_gallery_forbidden_keeps_the_private_body_verbatim() {
+        let repo = RepoInfo {
+            id: uuid::Uuid::new_v4(),
+            key: "vsx".to_string(),
+            storage_path: "/data/vsx".to_string(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "remote".to_string(),
+            upstream_url: None,
+            format: "vscode".to_string(),
+            promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
+        };
+        #[allow(clippy::disallowed_methods)]
+        // streaming-invariant: test helper exempt — buffering a small error body in a test assertion is not an artifact path (#1608)
+        async fn body(resp: Response) -> (StatusCode, String) {
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        let (status, private) = body(non_public_gallery_forbidden(
+            &repo,
+            RepositoryVisibility::Private,
+        ))
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            private,
+            "VS Code gallery routes are public-only: repository vsx is private. Gallery clients \
+             cannot present a credential, so private galleries are not supported. Make the \
+             repository public or use the /vscode/vsx/extensions/... routes."
+        );
+
+        let (status, internal) = body(non_public_gallery_forbidden(
+            &repo,
+            RepositoryVisibility::Internal,
+        ))
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            internal.contains("repository vsx is internal"),
+            "{internal}"
+        );
+        assert!(!internal.contains("is private"), "{internal}");
     }
 
     // -----------------------------------------------------------------------
